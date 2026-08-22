@@ -18,6 +18,7 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 
 import google.generativeai as genai
 from playwright.async_api import async_playwright
+from playwright_stealth import stealth_async
 
 # ==========================================
 # 1. CONFIGURACIÓN Y CREDENCIALES (con soporte para Render Env Vars)
@@ -517,6 +518,7 @@ async def ejecutar_analisis_proactivo(url: str, message: Message, state: FSMCont
             browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"])
             context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36", viewport={"width": 1280, "height": 800}, locale="es-CO", extra_http_headers={"Accept-Language": "es-ES,es;q=0.9"}, java_script_enabled=True)
             page = await context.new_page()
+            await stealth_async(page)
             await asyncio.sleep(random.uniform(1.0, 2.0))
             await page.goto(url, timeout=60000, wait_until="commit")
             await asyncio.sleep(random.uniform(2.0, 3.5))
@@ -615,6 +617,7 @@ async def cmd_hoy(message: Message, state: FSMContext):
             browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"])
             context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36", viewport={"width": 1280, "height": 800}, locale="es-CO", extra_http_headers={"Accept-Language": "es-ES,es;q=0.9"}, java_script_enabled=True)
             page = await context.new_page()
+            await stealth_async(page)
             await asyncio.sleep(random.uniform(1.0, 2.0))
             await page.goto("https://www.flashscore.co/", timeout=60000, wait_until="commit")
             await asyncio.sleep(random.uniform(4.0, 6.0))
@@ -958,6 +961,7 @@ async def procesar_combinada(message: Message, state: FSMContext):
             for idx, url in enumerate(partidos, 1):
                 try:
                     page = await context.new_page()
+            await stealth_async(page)
                     await asyncio.sleep(random.uniform(1.0, 2.5))
                     await page.goto(url, timeout=60000, wait_until="commit")
                     await asyncio.sleep(random.uniform(1.5, 3.0))
@@ -1175,6 +1179,7 @@ async def handle_user_flow(message: Message, state: FSMContext):
             browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"])
             context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36", viewport={"width": 1280, "height": 800}, locale="es-CO", extra_http_headers={"Accept-Language": "es-ES,es;q=0.9"}, java_script_enabled=True)
             page = await context.new_page()
+            await stealth_async(page)
             await asyncio.sleep(random.uniform(1.0, 3.0))
             await page.goto(url, timeout=60000, wait_until="commit")
             await asyncio.sleep(random.uniform(2.0, 4.5))
