@@ -520,22 +520,35 @@ async def ejecutar_analisis_proactivo(url: str, message: Message, state: FSMCont
             await asyncio.sleep(random.uniform(1.0, 2.0))
             await page.goto(url, timeout=60000, wait_until="commit")
             await asyncio.sleep(random.uniform(2.0, 3.5))
+            # 1) Esperar contenedor específico #detail (funciona en vivo y pre-partido) - NO body
             try:
-                await page.wait_for_selector('.duelParticipant, .detailScore__wrapper, .matchHistory', timeout=15000)
+                await page.wait_for_selector('#detail, .container__detail', timeout=10000)
             except Exception as e:
-                logging.warning(f"Flashscore bloqueó lectura (timeout elementos reales): {e}")
+                logging.warning(f"Flashscore bloqueó lectura (timeout #detail): {e}")
                 try:
                     await browser.close()
                 except Exception:
                     pass
                 await status_msg.edit_text("❌ Flashscore bloqueó la lectura del partido, intenta de nuevo")
                 return
-            body_text = await page.inner_text("body")
+            # 2) Extraer SOLO datos reales del contenedor, no menú genérico
+            try:
+                try:
+                    body_text = await page.inner_text('#detail')
+                except Exception:
+                    body_text = await page.inner_text('.container__detail')
+            except Exception as e:
+                logging.warning(f"Flashscore bloqueó lectura (inner_text #detail): {e}")
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+                await status_msg.edit_text("❌ Flashscore bloqueó la lectura del partido, intenta de nuevo")
+                return
             scraped_text = body_text[:3000]
-            # Validar que no sea solo menú genérico
             _low = scraped_text.lower()
-            _has_stats = any(k in _low for k in ["h2h", "historial", "alineación", "alineacion", "árbitro", "arbitro", "estadística", "estadistica", "duelparticipant", "head to head", "corners", "córners", "posesión", "posesion", "tarjetas", "goles", "matchhistory", "detail"])
-            if len(scraped_text.strip()) < 350 or not _has_stats:
+            _has_stats = any(k in _low for k in ["h2h", "historial", "alineación", "alineacion", "árbitro", "arbitro", "estadística", "estadistica", "head to head", "corners", "córners", "posesión", "posesion", "tarjetas", "goles", "formation", "lineup"])
+            if len(scraped_text.strip()) < 150 or not _has_stats:
                 try:
                     await browser.close()
                 except Exception:
@@ -575,7 +588,7 @@ async def ejecutar_analisis_proactivo(url: str, message: Message, state: FSMCont
     await state.update_data(scraped_text=f"{live_header}\n{scraped_text}", last_url=url, minute_live=minute_live, score_live=score_live)
     await status_msg.edit_text(f"📊 Estadísticas leídas. {live_header}. Analizando con lupa alineaciones y bajas...")
     try:
-        model = genai.GenerativeModel(model_name="gemini-3.6-flash", system_instruction=SYSTEM_INSTRUCTION)
+        model = genai.GenerativeModel(model_name="gemini-1.5-flash", system_instruction=SYSTEM_INSTRUCTION)
         prompt = f"{live_header}\nDatos extraídos de Flashscore (H2H, alineaciones probables, bajas de jugadores clave, árbitro, tendencias) - Partido: {url}\n\n{scraped_text}\n\n{live_header} - Gemini, usa este minuto/marcador para decidir: si >75' o marcador abultado, prohíbe mercados obsoletos."
         response = await asyncio.to_thread(model.generate_content, prompt)
         analysis_result = response.text.strip() if hasattr(response, "text") and response.text else str(response)
@@ -850,7 +863,7 @@ async def handle_ticket_photo(message: Message, bot: Bot, state: FSMContext):
         elif file.file_path.lower().endswith(".jpg") or file.file_path.lower().endswith(".jpeg"):
             mime = "image/jpeg"
 
-        model = genai.GenerativeModel(model_name="gemini-3.6-flash")
+        model = genai.GenerativeModel(model_name="gemini-1.5-flash")
         prompt = (
             "Eres extractor experto de tiquetes de apuestas colombianas (BetPlay, Wplay, Codere, Zamba). "
             "Analiza la captura de pantalla del tiquete y extrae JSON válido con: "
@@ -968,7 +981,7 @@ async def procesar_combinada(message: Message, state: FSMContext):
         return
     await status_msg.edit_text("📊 Datos leídos. Calculando viabilidad conjunta del parlay...")
     try:
-        model = genai.GenerativeModel(model_name="gemini-3.6-flash", system_instruction=SYSTEM_INSTRUCTION_COMBINADA)
+        model = genai.GenerativeModel(model_name="gemini-1.5-flash", system_instruction=SYSTEM_INSTRUCTION_COMBINADA)
         prompt = f"Datos combinados para Combinada/Parlay de {len(partidos)} partidos:\n\n" + "\n\n".join(textos_combinados)
         prompt += "\n\nRecuerda: revisa alineaciones y bajas, no inventes cuotas, 1 línea por selección, indica casa y viabilidad conjunta."
         response = await asyncio.to_thread(model.generate_content, prompt)
@@ -1165,21 +1178,35 @@ async def handle_user_flow(message: Message, state: FSMContext):
             await asyncio.sleep(random.uniform(1.0, 3.0))
             await page.goto(url, timeout=60000, wait_until="commit")
             await asyncio.sleep(random.uniform(2.0, 4.5))
+            # 1) Esperar contenedor específico #detail (vivo y pre-partido) - NO body
             try:
-                await page.wait_for_selector('.duelParticipant, .detailScore__wrapper, .matchHistory', timeout=15000)
+                await page.wait_for_selector('#detail, .container__detail', timeout=10000)
             except Exception as e:
-                logging.warning(f"Flashscore bloqueó lectura (timeout elementos reales): {e}")
+                logging.warning(f"Flashscore bloqueó lectura (timeout #detail): {e}")
                 try:
                     await browser.close()
                 except Exception:
                     pass
                 await status_msg.edit_text("❌ Flashscore bloqueó la lectura del partido, intenta de nuevo")
                 return
-            body_text = await page.inner_text("body")
+            # 2) Extraer SOLO datos reales del contenedor
+            try:
+                try:
+                    body_text = await page.inner_text('#detail')
+                except Exception:
+                    body_text = await page.inner_text('.container__detail')
+            except Exception as e:
+                logging.warning(f"Flashscore bloqueó lectura (inner_text #detail): {e}")
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+                await status_msg.edit_text("❌ Flashscore bloqueó la lectura del partido, intenta de nuevo")
+                return
             scraped_text = body_text[:3000]
             _low = scraped_text.lower()
-            _has_stats = any(k in _low for k in ["h2h", "historial", "alineación", "alineacion", "árbitro", "arbitro", "estadística", "estadistica", "duelparticipant", "head to head", "corners", "córners", "posesión", "posesion", "tarjetas", "goles", "matchhistory", "detail"])
-            if len(scraped_text.strip()) < 350 or not _has_stats:
+            _has_stats = any(k in _low for k in ["h2h", "historial", "alineación", "alineacion", "árbitro", "arbitro", "estadística", "estadistica", "head to head", "corners", "córners", "posesión", "posesion", "tarjetas", "goles", "formation", "lineup"])
+            if len(scraped_text.strip()) < 150 or not _has_stats:
                 try:
                     await browser.close()
                 except Exception:
@@ -1219,7 +1246,7 @@ async def handle_user_flow(message: Message, state: FSMContext):
     await state.update_data(scraped_text=f"{live_header}\n{scraped_text}", last_url=url, minute_live=minute_live, score_live=score_live)
     await status_msg.edit_text(f"📊 Estadísticas leídas. {live_header}. Analizando con lupa alineaciones y bajas...")
     try:
-        model = genai.GenerativeModel(model_name="gemini-3.6-flash", system_instruction=SYSTEM_INSTRUCTION)
+        model = genai.GenerativeModel(model_name="gemini-1.5-flash", system_instruction=SYSTEM_INSTRUCTION)
         prompt = f"{live_header}\nDatos extraídos de Flashscore (H2H, alineaciones probables, bajas de jugadores clave, árbitro, tendencias) - Partido: {url}\n\n{scraped_text}\n\n{live_header} - Gemini, usa este minuto/marcador para decidir: si >75' o marcador abultado, prohíbe mercados obsoletos."
         response = await asyncio.to_thread(model.generate_content, prompt)
         analysis_result = response.text.strip() if hasattr(response, "text") and response.text else str(response)
@@ -1252,7 +1279,7 @@ async def process_quota_chat(message: Message, state: FSMContext):
         return
     processing_msg = await message.answer("🤖 Analizando tu elección, parcero... calculando EV y stake...")
     try:
-        model = genai.GenerativeModel(model_name="gemini-3.6-flash", system_instruction=SYSTEM_INSTRUCTION_CUOTA)
+        model = genai.GenerativeModel(model_name="gemini-1.5-flash", system_instruction=SYSTEM_INSTRUCTION_CUOTA)
         prompt = (
             f"Contexto del partido (Flashscore - {last_url}):\n{scraped_text}\n\n"
             f"Consulta del usuario - Cuota y mercado a evaluar (BetPlay/Wplay/Codere/Zamba):\n{quota_input}\n\n"
