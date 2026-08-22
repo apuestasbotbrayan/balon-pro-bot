@@ -798,8 +798,26 @@ async def main():
     logging.info("Bot iniciado correctamente (aiogram v3.x) - Inline Keyboards + Historial")
     await dp.start_polling(bot)
 
-if __name__ == "__main__":
+# ==========================================
+# 7. SERVIDOR WEB FALSO PARA RENDER (evita Timed Out)
+# ==========================================
+import threading
+from flask import Flask
+
+web_app = Flask(__name__)
+
+@web_app.route('/')
+def home():
+    return '¡El Bot de Apuestas está activo 24/7, mi hermano! 🚀⚽'
+
+def run_web():
+    port = int(os.getenv('PORT', 10000))
+    web_app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+
+if __name__ == '__main__':
+    web_thread = threading.Thread(target=run_web, daemon=True)
+    web_thread.start()
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        logging.info("Bot detenido.")
+        logging.info('Bot detenido.')
