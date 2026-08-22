@@ -292,14 +292,14 @@ async def fetch_fotmob_data(url: str) -> tuple[str, str, str]:
     return _format(data)
 
 async def fetch_match_data(url: str) -> tuple[str, str, str]:
-    """Unifica FotMob y Flashscore: detecta dominio y usa la API correspondiente."""
+    """Brief: Unifica FotMob y Flashscore sin recursión infinita."""
     low = url.lower()
     if "fotmob.com" in low:
         txt, minute, score = await fetch_fotmob_data(url)
         if txt and len(txt.strip()) > 80:
             return txt, minute, score
-        # Fallback a flashscore si fotmob falla
-    return await fetch_match_data(url)
+    # Si es Flashscore o FotMob falló, usar Flashscore HTTP ligero
+    return await fetch_flashscore_text(url)
 
 # ==========================================
 # 1. CONFIGURACIÓN Y CREDENCIALES (con soporte para Render Env Vars)
