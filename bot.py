@@ -961,7 +961,7 @@ async def procesar_combinada(message: Message, state: FSMContext):
             for idx, url in enumerate(partidos, 1):
                 try:
                     page = await context.new_page()
-            await stealth_async(page)
+                    await stealth_async(page)
                     await asyncio.sleep(random.uniform(1.0, 2.5))
                     await page.goto(url, timeout=60000, wait_until="commit")
                     await asyncio.sleep(random.uniform(1.5, 3.0))
