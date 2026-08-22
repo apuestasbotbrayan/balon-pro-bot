@@ -245,6 +245,20 @@ async def fetch_match_data(url: str) -> tuple[str, str, str]:
     # Si es Flashscore o FotMob falló, usar Flashscore HTTP ligero
     return await fetch_flashscore_text(url)
 
+async def gemini_generate_with_retry(model, prompt, max_retries: int = 1):
+    """Capa gratuita: reintenta con pausa 3s si Gemini devuelve 429/quota/saturación, sin gastar de más."""
+    for attempt in range(max_retries + 1):
+        try:
+            return await asyncio.to_thread(model.generate_content, prompt)
+        except Exception as e:
+            msg = str(e).lower()
+            is_rate = any(k in msg for k in ["429", "resource_exhausted", "quota", "rate limit", "rate_limit", "saturated", "503", "overloaded", "too many requests", "exhausted"])
+            if is_rate and attempt < max_retries:
+                logging.warning(f"Gemini saturado/límite, reintentando en 3s (intento {attempt+1}/{max_retries})... Detail: {e}")
+                await asyncio.sleep(3)
+                continue
+            raise
+
 # ==========================================
 # 1. CONFIGURACIÓN Y CREDENCIALES (con soporte para Render Env Vars)
 # ==========================================
@@ -763,7 +777,7 @@ async def ejecutar_analisis_proactivo(url: str, message: Message, state: FSMCont
     try:
         model = genai.GenerativeModel(model_name="gemini-1.5-flash", system_instruction=SYSTEM_INSTRUCTION)
         prompt = f"Datos extraídos (Flashscore/FotMob) - Partido: {url}\n\n{scraped_text}\n\nUsa el Estado/Minuto/Marcador del texto para decidir: si >75' o marcador abultado, prohíbe mercados obsoletos."
-        response = await asyncio.to_thread(model.generate_content, prompt)
+        response = await gemini_generate_with_retry(model, prompt)
         analysis_result = response.text.strip() if hasattr(response, "text") and response.text else str(response)
         increment_user_usage(telegram_id)
         await message.answer(analysis_result, reply_markup=kb_proactivo())
@@ -995,7 +1009,7 @@ async def handle_ticket_photo(message: Message, bot: Bot, state: FSMContext):
             "Si es combinada/parlay con varios partidos, concatena en partido y toma la cuota total. "
             "Si no ves cuota, pon 0. Responde SOLO JSON, sin texto extra ni markdown."
         )
-        response = await asyncio.to_thread(model.generate_content, [prompt, {"mime_type": mime, "data": image_bytes}])
+        response = await gemini_generate_with_retry(model, [prompt, {"mime_type": mime, "data": image_bytes}])
         text = response.text.strip() if hasattr(response, "text") and response.text else ""
 
         partido = mercado = None
@@ -1094,7 +1108,7 @@ async def procesar_combinada(message: Message, state: FSMContext):
         model = genai.GenerativeModel(model_name="gemini-1.5-flash", system_instruction=SYSTEM_INSTRUCTION_COMBINADA)
         prompt = f"Datos combinados para Combinada/Parlay (Flashscore/FotMob) de {len(partidos)} partidos:\n\n" + "\n\n".join(textos_combinados)
         prompt += "\n\nRecuerda: revisa alineaciones y bajas, no inventes cuotas, 1 línea por selección, indica casa y viabilidad conjunta."
-        response = await asyncio.to_thread(model.generate_content, prompt)
+        response = await gemini_generate_with_retry(model, prompt)
         result = response.text.strip() if hasattr(response, "text") and response.text else str(response)
         increment_user_usage(telegram_id)
         combinado_text = "\n\n".join(textos_combinados)
@@ -1303,7 +1317,7 @@ async def handle_user_flow(message: Message, state: FSMContext):
     try:
         model = genai.GenerativeModel(model_name="gemini-1.5-flash", system_instruction=SYSTEM_INSTRUCTION)
         prompt = f"Datos extraídos (Flashscore/FotMob) - Partido: {url}\n\n{scraped_text}\n\nUsa el Estado/Minuto/Marcador del texto para decidir: si >75' o marcador abultado, prohíbe mercados obsoletos."
-        response = await asyncio.to_thread(model.generate_content, prompt)
+        response = await gemini_generate_with_retry(model, prompt)
         analysis_result = response.text.strip() if hasattr(response, "text") and response.text else str(response)
         increment_user_usage(telegram_id)
         await message.answer(analysis_result, reply_markup=kb_proactivo())
@@ -1341,7 +1355,7 @@ async def process_quota_chat(message: Message, state: FSMContext):
             f"Consulta del usuario - Cuota y mercado a evaluar (BetPlay/Wplay/Codere/Zamba):\n{quota_input}\n\n"
             f"Recuerda: revisa alineaciones y bajas con lupa, calcula 1/Cuota, EV >5% = VALOR. Menciona casa recomendada (BetPlay, Wplay, Codere o Zamba)."
         )
-        response = await asyncio.to_thread(model.generate_content, prompt)
+        response = await gemini_generate_with_retry(model, prompt)
         result = response.text.strip() if hasattr(response, "text") and response.text else str(response)
         try:
             match = re.search(r"(\d+[.,]\d+)", quota_input)
