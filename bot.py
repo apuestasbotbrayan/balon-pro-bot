@@ -870,7 +870,8 @@ async def ejecutar_analisis_proactivo(url: str, message: Message, state: FSMCont
         await state.set_state(AnalysisStates.waiting_for_quota_or_chat)
         await status_msg.delete()
     except Exception as e:
-        logging.exception(f"Error Gemini hoy: {e}")
+        logging.error(f'Gemini API Error Detail: {e}')
+        logging.exception(f"Gemini traceback: {e}")
         await status_msg.edit_text("❌ Error al conectar con Gemini para el análisis. Intenta de nuevo, parcero.")
         await state.set_state(AnalysisStates.waiting_for_quota_or_chat)
 
@@ -1202,7 +1203,8 @@ async def procesar_combinada(message: Message, state: FSMContext):
         await message.answer(result + f"\n\n✅ Combinada procesada. Descontado 1 uso de tus 10 diarios.", reply_markup=kb_cuota())
         await status_msg.delete()
     except Exception as e:
-        logging.exception(f"Error Gemini combinada: {e}")
+        logging.error(f'Gemini API Error Detail: {e}')
+        logging.exception(f"Gemini traceback: {e}")
         await status_msg.edit_text("❌ Error al calcular la combinada con Gemini. Intenta de nuevo, parcero.")
 
 # --- CALLBACKS INLINE KEYBOARDS ---
@@ -1407,7 +1409,8 @@ async def handle_user_flow(message: Message, state: FSMContext):
         await message.answer(analysis_result, reply_markup=kb_proactivo())
         await state.set_state(AnalysisStates.waiting_for_quota_or_chat)
     except Exception as e:
-        logging.exception(f"Error Gemini proactivo: {e}")
+        logging.error(f'Gemini API Error Detail: {e}')
+        logging.exception(f"Gemini traceback: {e}")
         await message.answer("❌ Error al conectar con Gemini para el análisis proactivo. Intenta de nuevo en unos segundos, parcero.", reply_markup=kb_proactivo())
         await state.set_state(AnalysisStates.waiting_for_quota_or_chat)
 
@@ -1481,7 +1484,8 @@ async def process_quota_chat(message: Message, state: FSMContext):
         await message.answer("¿Qué hacemos ahora, parcero?", reply_markup=kb_cuota())
         await state.set_state(AnalysisStates.waiting_for_quota_or_chat)
     except Exception as e:
-        logging.exception(f"Error Gemini cuota: {e}")
+        logging.error(f'Gemini API Error Detail: {e}')
+        logging.exception(f"Gemini traceback: {e}")
         await processing_msg.edit_text("❌ Error al evaluar la cuota con Gemini. Intenta de nuevo, mi hermano.")
 
 # ==========================================
