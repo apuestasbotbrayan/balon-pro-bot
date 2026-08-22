@@ -1,4 +1,6 @@
 import asyncio
+import io
+import json
 import logging
 import os
 import random
@@ -30,10 +32,13 @@ DB_NAME = "bot_database.db"
 
 genai.configure(api_key=GEMINI_API_KEY)
 
-# === PROMPT PROACTIVO CORREGIDO - SIN INVENTAR CUOTAS ===
+# === PROMPT PROACTIVO CORREGIDO - SIN INVENTAR CUOTAS + CONCIENCIA EN VIVO ===
 SYSTEM_INSTRUCTION = (
     "Actúa como tipster profesional colombiano parcero experto. Cuando recibas datos de Flashscore, "
     "REVISA CON LUPA las alineaciones probables y bajas de jugadores clave, además de árbitro, H2H y tendencias. "
+    "TE INYECTARÉ OBLIGATORIAMENTE el MINUTO ACTUAL (ej. 85', 90+2') y el MARCADOR EN VIVO (ej. 3-0) si el partido está en juego; si es programado dirá 'No iniciado'. "
+    "SÉ CONSCIENTE DEL MINUTO EXACTO: si minuto >75 o marcador abultado (ej. 3-0, 4-1), PROHIBIDO sugerir mercados pre-partido obsoletos como 'Ambos Anotan' si ya van 3-0, 'Over 2.5' si ya está definido, o 'Gana X' si no queda tiempo. "
+    "En esos casos enfoca SOLO mercados lógicos de cierre en vivo (ej. Under restante, córners finales, posesión, tarjetas por desesperación) o DESCARTA y di claramente 'Parcero, este partido ya va a finalizar, no hay valor, mejor pasamos' si no queda valor. "
     "Sé ULTRA RESUMIDO y VISUAL, sin floro. "
     "Saluda breve parcero ('¡Epa, mi hermano!') y presenta de una las 2 o 3 mejores Value Bets SIN INVENTAR CUOTAS FIJAS. "
     "PROHIBIDO poner números de cuota falsos (no escribas 'Cuota 1.65' si no te la dieron). "
@@ -521,6 +526,28 @@ async def ejecutar_analisis_proactivo(url: str, message: Message, state: FSMCont
                 pass
             body_text = await page.inner_text("body")
             scraped_text = body_text[:3000]
+            # === EXTRACCIÓN OBLIGATORIA MINUTO Y MARCADOR EN VIVO ===
+            try:
+                live_info = await page.evaluate("""() => {
+                    const timeEl = document.querySelector('.event__time, .event__stage, .detailScore__time, [class*="event__time"], [class*="detailTime"]');
+                    const scoreEl = document.querySelector('.event__score, .detailScore__wrapper, .detailScore, [class*="event__score"], [class*="score"]');
+                    let minute = timeEl ? timeEl.innerText.trim() : '';
+                    let score = scoreEl ? scoreEl.innerText.trim().replace(/\\s+/g,' ') : '';
+                    if (!minute || !score) {
+                        const txt = document.body.innerText;
+                        const m = txt.match(/\\b\\d{1,3}(?:\\+\\d+)?'\\b/);
+                        if (m && !minute) minute = m[0];
+                        const s = txt.match(/\\b\\d+\\s*[-:]\\s*\\d+\\b/);
+                        if (s && !score) score = s[0].replace(/\\s+/g,'').replace(':','-');
+                    }
+                    return {minute: minute || '', score: score || ''};
+                }""")
+                minute_live = live_info.get('minute', '').strip() if isinstance(live_info, dict) else ''
+                score_live = live_info.get('score', '').strip() if isinstance(live_info, dict) else ''
+            except Exception:
+                minute_live = ''
+                score_live = ''
+            live_header = f"MINUTO ACTUAL: {minute_live if minute_live else 'No iniciado / Sin dato'} | MARCADOR EN VIVO: {score_live if score_live else ('0-0 (programado)' if not minute_live else 'No detectado')}"
             await browser.close()
     except Exception as e:
         logging.exception(f"Error Playwright hoy: {e}")
@@ -529,11 +556,11 @@ async def ejecutar_analisis_proactivo(url: str, message: Message, state: FSMCont
     if not scraped_text.strip():
         await status_msg.edit_text("❌ No se pudo extraer contenido del partido.")
         return
-    await state.update_data(scraped_text=scraped_text, last_url=url)
-    await status_msg.edit_text("📊 Estadísticas leídas. Analizando con lupa alineaciones y bajas...")
+    await state.update_data(scraped_text=f"{live_header}\n{scraped_text}", last_url=url, minute_live=minute_live, score_live=score_live)
+    await status_msg.edit_text(f"📊 Estadísticas leídas. {live_header}. Analizando con lupa alineaciones y bajas...")
     try:
         model = genai.GenerativeModel(model_name="gemini-3.6-flash", system_instruction=SYSTEM_INSTRUCTION)
-        prompt = f"Datos extraídos de Flashscore (H2H, alineaciones probables, bajas de jugadores clave, árbitro, tendencias) - Partido: {url}\n\n{scraped_text}"
+        prompt = f"{live_header}\nDatos extraídos de Flashscore (H2H, alineaciones probables, bajas de jugadores clave, árbitro, tendencias) - Partido: {url}\n\n{scraped_text}\n\n{live_header} - Gemini, usa este minuto/marcador para decidir: si >75' o marcador abultado, prohíbe mercados obsoletos."
         response = await asyncio.to_thread(model.generate_content, prompt)
         analysis_result = response.text.strip() if hasattr(response, "text") and response.text else str(response)
         increment_user_usage(telegram_id)
@@ -782,6 +809,102 @@ async def cmd_hoy(message: Message, state: FSMContext):
         parse_mode="Markdown",
         reply_markup=kb
     )
+
+# --- VISIÓN ARTIFICIAL: TIQUETE POR FOTO ---
+@router.message(F.photo)
+async def handle_ticket_photo(message: Message, bot: Bot, state: FSMContext):
+    telegram_id = message.from_user.id
+    allowed, err_msg = check_user_valid(telegram_id)
+    if not allowed:
+        await message.answer(err_msg)
+        return
+    processing = await message.answer("📸 Recibí tu tiquete, parcero — leyendo con visión artificial... ⏳")
+    try:
+        photo = message.photo[-1]
+        file = await bot.get_file(photo.file_id)
+        buf = io.BytesIO()
+        await bot.download_file(file.file_path, buf)
+        buf.seek(0)
+        image_bytes = buf.getvalue()
+        mime = "image/jpeg"
+        if file.file_path.lower().endswith(".png"):
+            mime = "image/png"
+        elif file.file_path.lower().endswith(".webp"):
+            mime = "image/webp"
+        elif file.file_path.lower().endswith(".jpg") or file.file_path.lower().endswith(".jpeg"):
+            mime = "image/jpeg"
+
+        model = genai.GenerativeModel(model_name="gemini-3.6-flash")
+        prompt = (
+            "Eres extractor experto de tiquetes de apuestas colombianas (BetPlay, Wplay, Codere, Zamba). "
+            "Analiza la captura de pantalla del tiquete y extrae JSON válido con: "
+            '{"partido": "Equipo A vs Equipo B", "mercado": "Más de 2.5 goles", "cuota": 1.85}. '
+            "Si es combinada/parlay con varios partidos, concatena en partido y toma la cuota total. "
+            "Si no ves cuota, pon 0. Responde SOLO JSON, sin texto extra ni markdown."
+        )
+        response = await asyncio.to_thread(model.generate_content, [prompt, {"mime_type": mime, "data": image_bytes}])
+        text = response.text.strip() if hasattr(response, "text") and response.text else ""
+
+        partido = mercado = None
+        cuota = 0.0
+        try:
+            json_match = re.search(r"\{.*\}", text, re.DOTALL)
+            if json_match:
+                data_json = json.loads(json_match.group(0))
+                partido = str(data_json.get("partido", "")).strip() or "Tiquete por foto"
+                mercado = str(data_json.get("mercado", "")).strip() or "Mercado por foto"
+                cuota = float(str(data_json.get("cuota", 0)).replace(",", "."))
+            else:
+                raise ValueError("No JSON")
+        except Exception:
+            partido = "Tiquete por foto"
+            mercado = (text[:120].replace("\n", " ").strip() if text else "Mercado por foto")
+            m = re.search(r"(\d+[.,]\d+)", text)
+            if m:
+                try:
+                    cuota = float(m.group(1).replace(",", "."))
+                except Exception:
+                    cuota = 0.0
+
+        if not partido:
+            partido = "Tiquete por foto"
+        if not mercado:
+            mercado = "Mercado por foto"
+
+        fecha_now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO historial_apuestas (telegram_id, partido, mercado, cuota, estado, fecha) VALUES (?, ?, ?, ?, 'PENDIENTE', ?)",
+            (telegram_id, partido[:300], mercado[:120], cuota, fecha_now)
+        )
+        conn.commit()
+        hid = cursor.lastrowid
+        conn.close()
+
+        banca = get_banca(telegram_id)
+        if banca and banca > 0:
+            stake2 = banca * 0.02
+            stake3 = banca * 0.03
+            stake_msg = f"\n💰 Banca {format_pesos(banca)} → 2% {format_pesos(stake2)} | 3% {format_pesos(stake3)}\n👉 Sugerido: {format_pesos(stake3)} (3% valor)"
+        else:
+            stake_msg = "\n💡 Configura tu banca con /banca 200000 para cálculo de stake"
+
+        await processing.edit_text(
+            f"📸 *¡Tiquete leído, mi hermano!* ✅\n\n"
+            f"🏟️ Partido: {partido}\n"
+            f"🎯 Mercado: {mercado}\n"
+            f"💵 Cuota: {cuota:.2f}\n\n"
+            f"📝 Guardado en historial como `#{hid}` ⏳ Pendiente — ver con /historial"
+            f"{stake_msg}",
+            parse_mode="Markdown",
+            reply_markup=kb_cuota()
+        )
+        await state.update_data(scraped_text=f"Tiquete foto: {partido} - {mercado}", last_url=partido)
+        await state.set_state(AnalysisStates.waiting_for_quota_or_chat)
+    except Exception as e:
+        logging.exception(f"Error visión tiquete: {e}")
+        await processing.edit_text("❌ No pude leer tu tiquete, parcero. Asegúrate que la foto sea nítida (que se vean BetPlay/Wplay/Codere/Zamba, partido, mercado y cuota) y reenvíala sin recortar la cuota total.")
 
 async def procesar_combinada(message: Message, state: FSMContext):
     telegram_id = message.from_user.id
@@ -1032,6 +1155,28 @@ async def handle_user_flow(message: Message, state: FSMContext):
                 pass
             body_text = await page.inner_text("body")
             scraped_text = body_text[:3000]
+            # === EXTRACCIÓN OBLIGATORIA MINUTO Y MARCADOR EN VIVO ===
+            try:
+                live_info = await page.evaluate("""() => {
+                    const timeEl = document.querySelector('.event__time, .event__stage, .detailScore__time, [class*="event__time"], [class*="detailTime"]');
+                    const scoreEl = document.querySelector('.event__score, .detailScore__wrapper, .detailScore, [class*="event__score"], [class*="score"]');
+                    let minute = timeEl ? timeEl.innerText.trim() : '';
+                    let score = scoreEl ? scoreEl.innerText.trim().replace(/\\s+/g,' ') : '';
+                    if (!minute || !score) {
+                        const txt = document.body.innerText;
+                        const m = txt.match(/\\b\\d{1,3}(?:\\+\\d+)?'\\b/);
+                        if (m && !minute) minute = m[0];
+                        const s = txt.match(/\\b\\d+\\s*[-:]\\s*\\d+\\b/);
+                        if (s && !score) score = s[0].replace(/\\s+/g,'').replace(':','-');
+                    }
+                    return {minute: minute || '', score: score || ''};
+                }""")
+                minute_live = live_info.get('minute', '').strip() if isinstance(live_info, dict) else ''
+                score_live = live_info.get('score', '').strip() if isinstance(live_info, dict) else ''
+            except Exception:
+                minute_live = ''
+                score_live = ''
+            live_header = f"MINUTO ACTUAL: {minute_live if minute_live else 'No iniciado / Sin dato'} | MARCADOR EN VIVO: {score_live if score_live else ('0-0 (programado)' if not minute_live else 'No detectado')}"
             await browser.close()
     except Exception as e:
         logging.exception(f"Error Playwright: {e}")
@@ -1040,11 +1185,11 @@ async def handle_user_flow(message: Message, state: FSMContext):
     if not scraped_text.strip():
         await status_msg.edit_text("❌ No se pudo extraer contenido. El sitio puede estar bloqueando el scraping.")
         return
-    await state.update_data(scraped_text=scraped_text, last_url=url)
-    await status_msg.edit_text("📊 Estadísticas leídas. Analizando con lupa alineaciones y bajas para sacarte las mejores opciones...")
+    await state.update_data(scraped_text=f"{live_header}\n{scraped_text}", last_url=url, minute_live=minute_live, score_live=score_live)
+    await status_msg.edit_text(f"📊 Estadísticas leídas. {live_header}. Analizando con lupa alineaciones y bajas...")
     try:
         model = genai.GenerativeModel(model_name="gemini-3.6-flash", system_instruction=SYSTEM_INSTRUCTION)
-        prompt = f"Datos extraídos de Flashscore (H2H, alineaciones probables, bajas de jugadores clave, árbitro, tendencias) - Partido: {url}\n\n{scraped_text}"
+        prompt = f"{live_header}\nDatos extraídos de Flashscore (H2H, alineaciones probables, bajas de jugadores clave, árbitro, tendencias) - Partido: {url}\n\n{scraped_text}\n\n{live_header} - Gemini, usa este minuto/marcador para decidir: si >75' o marcador abultado, prohíbe mercados obsoletos."
         response = await asyncio.to_thread(model.generate_content, prompt)
         analysis_result = response.text.strip() if hasattr(response, "text") and response.text else str(response)
         increment_user_usage(telegram_id)
