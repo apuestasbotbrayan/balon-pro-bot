@@ -62,7 +62,6 @@ async def fetch_flashscore_text(url: str) -> tuple[str, str, str]:
     """HTTP ligero sin Playwright: retorna (texto_limpio, minute, score). Prueba curl_cffi impersonate + fallback requests + URL móvil."""
     def _fetch(u: str) -> str:
         headers = dict(HEADERS_CHROME)
-        # Intentar curl_cffi con impersonate Chrome (mejor TLS fingerprint)
         if HAS_CURL and curl_requests is not None:
             try:
                 resp = curl_requests.get(u, headers=headers, impersonate="chrome110", timeout=15000)
@@ -70,7 +69,6 @@ async def fetch_flashscore_text(url: str) -> tuple[str, str, str]:
                     return resp.text
             except Exception:
                 pass
-        # Fallback requests
         try:
             resp = req_requests.get(u, headers=headers, timeout=15000)
             if resp.status_code == 200 and len(resp.text) > 500:
@@ -88,10 +86,8 @@ async def fetch_flashscore_text(url: str) -> tuple[str, str, str]:
         if HAS_BS4:
             try:
                 soup = BeautifulSoup(html, "html.parser")
-                # Eliminar scripts/styles
                 for tag in soup(["script", "style", "noscript"]):
                     tag.decompose()
-                # Intentar contenedor específico #detail
                 detail = soup.select_one("#detail, .container__detail")
                 if detail:
                     text = detail.get_text(separator="\n", strip=True)
@@ -101,9 +97,7 @@ async def fetch_flashscore_text(url: str) -> tuple[str, str, str]:
                 text = re.sub(r"<[^>]+>", "\n", html)
         else:
             text = re.sub(r"<[^>]+>", "\n", html)
-        # Limpiar
         text = re.sub(r"\n{2,}", "\n", text).strip()[:4000]
-        # Extraer minuto y marcador del texto limpio
         m = re.search(r"\b\d{1,3}(?:\+\d+)?'\b", text)
         if m:
             minute = m.group(0)
@@ -112,9 +106,7 @@ async def fetch_flashscore_text(url: str) -> tuple[str, str, str]:
             score = s.group(0).replace(" ", "").replace(":", "-")
         return text, minute, score
 
-    # Intentar URL original y luego móvil
     candidates = [url, _to_mobile_url(url)]
-    # Para /hoy lista, la principal ya es https://www.flashscore.co/
     for cand in candidates:
         html = await asyncio.to_thread(_fetch, cand)
         txt, minute, score = _extract(html)
@@ -123,11 +115,9 @@ async def fetch_flashscore_text(url: str) -> tuple[str, str, str]:
         if len(txt.strip()) > 400 or has_stats:
             return txt[:3000], minute, score
         if len(txt.strip()) > 150:
-            # Guardar como último intento
             last = (txt[:3000], minute, score)
         else:
             last = ("", "", "")
-    # Si no hay buen contenido, devolver último intento aunque sea corto (Gemini decidirá)
     try:
         return last
     except Exception:
@@ -236,23 +226,21 @@ async def fetch_fotmob_data(url: str) -> tuple[str, str, str]:
     return _format(data)
 
 async def fetch_match_data(url: str) -> tuple[str, str, str]:
-    """Brief: Unifica FotMob y Flashscore sin recursión infinita."""
     low = url.lower()
     if "fotmob.com" in low:
         txt, minute, score = await fetch_fotmob_data(url)
         if txt and len(txt.strip()) > 80:
             return txt, minute, score
-    # Si es Flashscore o FotMob falló, usar Flashscore HTTP ligero
     return await fetch_flashscore_text(url)
 
 async def gemini_generate_with_retry(model, prompt, max_retries: int = 1):
-    """Capa gratuita: reintenta con pausa 3s si Gemini devuelve 429/quota/saturación, sin gastar de más."""
+    """Capa gratuita: reintenta con pausa 3s si Gemini devuelve 429/quota/saturación."""
     for attempt in range(max_retries + 1):
         try:
             return await asyncio.to_thread(model.generate_content, prompt)
         except Exception as e:
             msg = str(e).lower()
-            is_rate = any(k in msg for k in ["429", "resource_exhausted", "quota", "rate limit", "rate_limit", "saturated", "503", "overloaded", "too many requests", "exhausted"])
+            is_rate = any(k in msg for k in ["429", "resource_exhausted", "quota", "rate limit", "rate_limit", "saturated", "503", "overloaded", "too many requests", "exhausted", "not found"])
             if is_rate and attempt < max_retries:
                 logging.warning(f"Gemini saturado/límite, reintentando en 3s (intento {attempt+1}/{max_retries})... Detail: {e}")
                 await asyncio.sleep(3)
@@ -260,10 +248,8 @@ async def gemini_generate_with_retry(model, prompt, max_retries: int = 1):
             raise
 
 # ==========================================
-# 1. CONFIGURACIÓN Y CREDENCIALES (con soporte para Render Env Vars)
+# 1. CONFIGURACIÓN Y CREDENCIALES
 # ==========================================
-# En Render configura estas 3 como Environment Variables para no exponerlas en GitHub.
-# Si no existen, usa los valores por defecto (útil en local).
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8785828541:AAHuZoLPpmwDYXzXl92b_PxMDxJ3jpY0Q6g")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AQ.Ab8RN6L6QbT8s_T80lfuqrz9ugSoqf3Cgolk5nwWAsJC6PT_gA")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "8021280020"))
@@ -272,7 +258,9 @@ DB_NAME = "bot_database.db"
 
 genai.configure(api_key=GEMINI_API_KEY)
 
-# === PROMPT PROACTIVO CORREGIDO - SIN INVENTAR CUOTAS + CONCIENCIA EN VIVO ===
+# MODELO ESTABLE VERIFICADO PARA LA API V1BETA
+GEMINI_MODEL = "gemini-1.5-flash"
+
 SYSTEM_INSTRUCTION = (
     "Actúa como tipster profesional colombiano parcero experto. Cuando recibas datos de un partido (Flashscore/FotMob), "
     "REVISA CON LUPA las alineaciones probables y bajas de jugadores clave, además de árbitro, H2H y tendencias. "
@@ -291,7 +279,6 @@ SYSTEM_INSTRUCTION = (
     "PROHIBIDO párrafos largos o explicar probabilidad implícita."
 )
 
-# === EVALUACIÓN DE CUOTA OPTIMIZADA - AL GRANO + CASA COLOMBIANA ===
 SYSTEM_INSTRUCTION_CUOTA = (
     "Actúa como tipster colombiano parcero firme y directo. Cuando el usuario te dé una cuota/mercado, "
     "calcula Probabilidad Implícita (1/Cuota) y EV internamente pero NO muestres fórmula larga. "
@@ -303,7 +290,6 @@ SYSTEM_INSTRUCTION_CUOTA = (
     "Tono firme, parcero, sin floro ni explicaciones matemáticas aburridas."
 )
 
-# === PROMPT PARA COMBINADAS / PARLAYS ===
 SYSTEM_INSTRUCTION_COMBINADA = (
     "Actúa como tipster profesional colombiano parcero experto en combinadas/parlays. "
     "Recibes datos de VARIOS partidos de Flashscore para armar una combinada. "
@@ -354,10 +340,9 @@ def kb_combinada() -> InlineKeyboardMarkup:
     ])
 
 # ==========================================
-# 3. CAPA DE DATOS (SQLite) Y CONTROL DE ACCESO
+# 3. CAPA DE DATOS (SQLite)
 # ==========================================
 def init_db():
-    """Crea las tablas: usuarios, licencias, historial_apuestas + migraciones."""
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute("""
@@ -403,13 +388,13 @@ def check_user_access(telegram_id: int):
     if not row:
         return False, "⛔ Acceso denegado. No estás registrado. Usa /start y proporciona tu código de licencia."
     enlaces_hoy, fecha_expiracion_str, ultimo_uso = row
-    today_str = datetime.now().strftime("%Y-%m-%d")
     try:
         exp_date = datetime.strptime(fecha_expiracion_str, "%Y-%m-%d")
         if datetime.now().date() > exp_date.date():
             return False, "❌ Tu licencia ha expirado. Contacta al administrador para renovarla."
     except Exception:
         return False, "❌ Error al verificar la expiración de tu licencia."
+    today_str = datetime.now().strftime("%Y-%m-%d")
     if ultimo_uso != today_str:
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
@@ -656,7 +641,6 @@ async def cmd_generar(message: Message):
     conn.close()
     await message.answer(f"🔑 Licencia generada:\n• Código: `{codigo}`\n• Duración: {dias} días\n• Estado: No usada")
 
-# --- HISTORIAL Y CALIFICACIÓN ---
 @router.message(Command("historial"))
 async def cmd_historial(message: Message):
     telegram_id = message.from_user.id
@@ -679,7 +663,7 @@ async def cmd_calificar(message: Message):
     try:
         apuesta_id = int(args[1])
     except ValueError:
-        await message.answer("❌ ID inválido. Debe ser número. Ej: `/calificar 12 acertado`")
+        await message.answer("❌ ID inválido. Debe ser número.")
         return
     estado_raw = args[2].lower()
     if estado_raw not in ("acertado", "fallido"):
@@ -707,7 +691,6 @@ async def cmd_calificar(message: Message):
     emoji = "🟢" if estado == "ACERTADO" else "🔴"
     await message.answer(f"{emoji} Apuesta `#{apuesta_id}` marcada como *{estado}*.\nUsuario `{telegram_id_user}` — Efectividad: {ef:.1f}% ({ac}✅/{cal})", parse_mode="Markdown")
 
-# --- COMBINADAS ---
 @router.message(Command("combinada"))
 async def cmd_combinada(message: Message, state: FSMContext):
     telegram_id = message.from_user.id
@@ -719,64 +702,42 @@ async def cmd_combinada(message: Message, state: FSMContext):
     await state.update_data(partidos_combinada=[])
     await message.answer(
         "🎯 *Modo Combinada activado, mi hermano!*\n\n"
-        "Envíame varios enlaces de Flashscore/FotMob uno por uno (Partido 1, Partido 2...).\n"
-        "Los voy acumulando sin descontar tu límite diario.\n\n"
-        "Cuando termines escribe `/calcular_combinada` o `listo` y te armo el parlay.\n"
-        "💡 Tip: puedes mandar 2 a 5 partidos.",
+        "Envíame varios enlaces de Flashscore/FotMob uno por uno.\n"
+        "Cuando termines escribe `/calcular_combinada` o `listo` y te armo el parlay.",
         parse_mode="Markdown",
         reply_markup=kb_combinada()
     )
 
 @router.message(Command("cancelar"))
 async def cmd_cancelar_combinada(message: Message, state: FSMContext):
-    data = await state.get_data()
-    if "partidos_combinada" in data:
-        await state.update_data(partidos_combinada=[])
-        await state.set_state(AnalysisStates.waiting_for_link)
-        await message.answer("❌ Combinada cancelada. Volviste al modo normal. Envíame un enlace suelto si quieres.", reply_markup=kb_proactivo())
-    else:
-        await state.set_state(AnalysisStates.waiting_for_link)
-        await message.answer("✅ Modo normal activado.", reply_markup=kb_proactivo())
+    await state.set_state(AnalysisStates.waiting_for_link)
+    await message.answer("✅ Modo normal activado.", reply_markup=kb_proactivo())
 
 @router.message(Command("calcular_combinada"))
 async def cmd_calcular_combinada(message: Message, state: FSMContext):
     await procesar_combinada(message, state)
 
-# --- COMANDO HOY / EN VIVO - PARTIDOS EN DIRECTO ---
 async def ejecutar_analisis_proactivo(url: str, message: Message, state: FSMContext):
-    """Reutiliza el análisis proactivo individual para un URL dado (usado por /hoy y callbacks)."""
     telegram_id = message.from_user.id
     allowed, err_msg = check_user_access(telegram_id)
     if not allowed:
         await message.answer(err_msg, reply_markup=kb_proactivo())
         return
-    status_msg = await message.answer("🔍 Enlace seleccionado, parcero. Extrayendo vía HTTP ligero (sin navegador, evadiendo Cloudflare)...", reply_markup=kb_proactivo())
-    # HTTP directo con headers Chrome real + curl_cffi (TLS fingerprint) + fallback móvil
+    status_msg = await message.answer("🔍 Enlace seleccionado, parcero. Extrayendo vía HTTP ligero...", reply_markup=kb_proactivo())
     try:
         scraped_text, minute_live, score_live = await fetch_match_data(url)
-        # Si HTTP no trajo stats, intentar móvil ya está dentro de fetch
         if not scraped_text or len(scraped_text.strip()) < 150:
             await status_msg.edit_text("❌ Flashscore bloqueó la lectura del partido, intenta de nuevo")
             return
-        _low = scraped_text.lower()
-        _has_stats = any(k in _low for k in ["h2h", "historial", "alineación", "alineacion", "árbitro", "arbitro", "estadística", "estadistica", "head to head", "corners", "córners", "posesión", "posesion", "tarjetas", "goles", "formation", "lineup"])
-        if len(scraped_text.strip()) < 150 or not _has_stats:
-            # Enviar igual a Gemini si tiene algo, pero advertir; por ahora abortar para no gastar tokens en basura
-            await status_msg.edit_text("❌ Flashscore bloqueó la lectura del partido, intenta de nuevo")
-            return
-        # scraped_text ya trae Estado/Minuto/Marcador formateados correctamente desde fetch_match_data - no reconstruir live_header
     except Exception as e:
         logging.exception(f"Error HTTP ligero: {e}")
-        await status_msg.edit_text("❌ Error al extraer datos del partido. Intenta con otro enlace, mi hermano.")
-        return
-    if not scraped_text.strip():
-        await status_msg.edit_text("❌ No se pudo extraer contenido del partido.")
+        await status_msg.edit_text("❌ Error al extraer datos del partido. Intenta de novo, mi hermano.")
         return
     await state.update_data(scraped_text=scraped_text, last_url=url, minute_live=minute_live, score_live=score_live)
     await status_msg.edit_text(f"📊 Datos listos. Analizando con lupa alineaciones y bajas...")
     try:
-        model = genai.GenerativeModel(model_name="gemini-2.5-flash", system_instruction=SYSTEM_INSTRUCTION)
-        prompt = f"Datos extraídos (Flashscore/FotMob) - Partido: {url}\n\n{scraped_text}\n\nUsa el Estado/Minuto/Marcador del texto para decidir: si >75' o marcador abultado, prohíbe mercados obsoletos."
+        model = genai.GenerativeModel(model_name=GEMINI_MODEL, system_instruction=SYSTEM_INSTRUCTION)
+        prompt = f"Datos extraídos (Flashscore/FotMob) - Partido: {url}\n\n{scraped_text}\n\nUsa el Estado/Minuto/Marcador del texto para decidir."
         response = await gemini_generate_with_retry(model, prompt)
         analysis_result = response.text.strip() if hasattr(response, "text") and response.text else str(response)
         increment_user_usage(telegram_id)
@@ -785,8 +746,7 @@ async def ejecutar_analisis_proactivo(url: str, message: Message, state: FSMCont
         await status_msg.delete()
     except Exception as e:
         logging.error(f'Gemini API Error Detail: {e}')
-        logging.exception(f"Gemini traceback: {e}")
-        await status_msg.edit_text("❌ Error al conectar con Gemini para el análisis. Intenta de nuevo, parcero.")
+        await status_msg.edit_text("❌ Error al conectar con Gemini para el análisis. Intenta de nuevo, parcero.", reply_markup=kb_proactivo())
         await state.set_state(AnalysisStates.waiting_for_quota_or_chat)
 
 @router.message(Command(commands=["hoy", "en_vivo", "envivo"]))
@@ -796,10 +756,9 @@ async def cmd_hoy(message: Message, state: FSMContext):
     if not allowed:
         await message.answer(err_msg)
         return
-    status_msg = await message.answer("🔍 Buscando partidos del día en Flashscore (en vivo + programados), parcero... filtrando los de mayor valor para ti ⏳")
+    status_msg = await message.answer("🔍 Buscando partidos del día en Flashscore (en vivo + programados)... ⏳")
     partidos = []
     try:
-        # HTTP ligero para lista del día (sin navegador) - curl_cffi con headers Chrome real
         def _fetch_hoy(u: str) -> str:
             headers = dict(HEADERS_CHROME)
             if HAS_CURL and curl_requests is not None:
@@ -817,167 +776,49 @@ async def cmd_hoy(message: Message, state: FSMContext):
                 pass
             return ""
         html = await asyncio.to_thread(_fetch_hoy, "https://www.flashscore.co/")
-        if not html or len(html) < 1000:
-            html_m = await asyncio.to_thread(_fetch_hoy, "https://m.flashscore.co/")
-            if html_m and len(html_m) > len(html):
-                html = html_m
         raw = []
         seen = set()
         if HAS_BS4 and html:
-            try:
-                from bs4 import BeautifulSoup as BS
-                soup = BS(html, "html.parser")
-                containers = soup.select(".event__match, .event__game, [id^=\"g_1\"] div.event__match, li.event__match")
-                anchors_fallback = soup.select('a[href*="/partido/"], a[href*="/match/"]')
-                if not containers:
-                    containers = []
-                def _parse_container(container, href_override=None):
-                    href = href_override
-                    if not href:
-                        a = container.select_one('a[href*="/partido/"], a[href*="/match/"], a')
-                        href = a.get("href") if a else None
-                        if href and href.startswith("/"):
-                            href = "https://www.flashscore.co" + href
-                    if not href or href in seen:
-                        return None
-                    if "/partido/" not in href and "/match/" not in href:
-                        return None
-                    seen.add(href)
-                    txt = container.get_text(separator=" ", strip=True)
-                    import re as re_inner
-                    minute = None
-                    score = None
-                    time = None
-                    m = re_inner.search(r"\b\d{1,3}(?:\+\d+)?'\b", txt)
-                    if m:
-                        minute = m.group(0)
-                    s = re_inner.search(r"\b\d+\s*[-:]\s*\d+\b", txt)
-                    if s:
-                        score = s.group(0).replace(" ", "").replace(":", "-")
-                    t = re_inner.search(r"\b\d{1,2}:\d{2}\b", txt)
-                    if t and not minute:
-                        time = t.group(0)
-                    parts = container.select(".event__participant")
-                    teams = ""
-                    if len(parts) >= 2:
-                        teams = " vs ".join([pp.get_text(strip=True) for pp in parts[:2]])
-                    if not teams or len(teams) < 3:
-                        a = container.select_one('a[href*="/partido/"]')
-                        if a:
-                            teams = a.get_text(strip=True)
-                    if not teams or len(teams) < 3:
-                        teams = txt.replace(minute or "", "").replace(score or "", "").replace(time or "", "").strip()[:40]
-                    teams = " ".join(teams.split())
-                    if len(teams) > 32:
-                        teams = teams[:32] + "…"
-                    if len(teams) < 3:
-                        return None
-                    is_live = bool(minute or score and "en vivo" in txt.lower())
-                    if score and minute:
-                        is_live = True
-                    league_text = ""
-                    parent = container.parent
-                    tries = 0
-                    while parent and tries < 5:
-                        hdr = parent.select_one(".event__header, .sportName")
-                        if hdr and hdr.get_text(strip=True):
-                            league_text = hdr.get_text(strip=True)
-                            break
-                        parent = parent.parent
-                        tries += 1
-                    def get_league_score(t):
-                        tu = (t or "").upper()
-                        if any(k in tu for k in ["PRIMERA A", "BETPLAY", "DIMAYOR"]):
-                            return 100
-                        if any(k in tu for k in ["PREMIER LEAGUE", "LA LIGA", "SERIE A", "BUNDESLIGA", "CHAMPIONS", "LIBERTADORES"]):
-                            return 95
-                        if "AMISTOSO" in tu or "FRIENDLY" in tu:
-                            return 10
-                        return 35
-                    league_score = get_league_score(league_text + " " + txt + " " + teams)
-                    if is_live and minute and score:
-                        display = f"{minute} [{score}] {teams}"
-                    elif is_live and score:
-                        display = f"EN VIVO [{score}] {teams}"
-                    elif is_live and minute:
-                        display = f"{minute} {teams}"
-                    elif time:
-                        display = f"{time} - {teams}"
-                    else:
-                        display = teams
-                    sort_key = 9999
-                    if is_live:
-                        try:
-                            m2 = int(re_inner.search(r"\d+", minute or "0").group(0))
-                        except:
-                            m2 = 0
-                        sort_key = -1000 + (100 - m2)
-                    elif time:
-                        try:
-                            h, mi = map(int, time.split(":"))
-                            sort_key = h*60+mi
-                        except:
-                            sort_key = 9999
-                    attractive = 1 if (is_live and score and score != "0-0") else 0
-                    return {"href": href, "text": display, "isLive": is_live, "sortKey": sort_key, "attractive": attractive, "leagueScore": league_score}
-                for c in containers:
-                    if len(raw) >= 30:
-                        break
-                    r = _parse_container(c)
-                    if r:
-                        raw.append(r)
-                if len(raw) < 6:
-                    for a in anchors_fallback:
-                        href = a.get("href")
-                        if href and href.startswith("/"):
-                            href = "https://www.flashscore.co" + href
-                        if not href or href in seen:
-                            continue
-                        cont = a.find_parent(class_=lambda x: x and "event__match" in x) or a.parent
-                        r = _parse_container(cont, href)
-                        if r:
-                            raw.append(r)
-                        if len(raw) >= 30:
-                            break
-                raw.sort(key=lambda x: (not x["isLive"], -x["leagueScore"], -x["attractive"], x["sortKey"]))
-                partidos = [{"href": r["href"], "text": r["text"], "isLive": r["isLive"]} for r in raw[:12]]
-                if not partidos:
-                    partidos = []
-            except Exception as e:
-                logging.exception(f"Error HTTP /hoy: {e}")
-                partidos = []
+            from bs4 import BeautifulSoup as BS
+            soup = BS(html, "html.parser")
+            containers = soup.select(".event__match, .event__game, [id^=\"g_1\"] div.event__match, li.event__match")
+            for c in containers:
+                if len(raw) >= 30:
+                    break
+                a = c.select_one('a[href*="/partido/"], a[href*="/match/"], a')
+                href = a.get("href") if a else None
+                if href and href.startswith("/"):
+                    href = "https://www.flashscore.co" + href
+                if not href or href in seen:
+                    continue
+                seen.add(href)
+                txt = c.get_text(separator=" ", strip=True)
+                m = re.search(r"\b\d{1,3}(?:\+\d+)?'\b", txt)
+                minute = m.group(0) if m else None
+                s = re.search(r"\b\d+\s*[-:]\s*\d+\b", txt)
+                score = s.group(0).replace(" ", "").replace(":", "-") if s else None
+                t = re.search(r"\b\d{1,2}:\d{2}\b", txt)
+                time = t.group(0) if t and not minute else None
+                parts = c.select(".event__participant")
+                teams = " vs ".join([pp.get_text(strip=True) for pp in parts[:2]]) if len(parts) >= 2 else txt[:35]
+                is_live = bool(minute or score)
+                display = f"{minute or 'EN VIVO'} {teams}" if is_live else f"{time or ''} - {teams}"
+                raw.append({"href": href, "text": display, "isLive": is_live})
+            partidos = [{"href": r["href"], "text": r["text"], "isLive": r["isLive"]} for r in raw[:12]]
     except Exception as e:
         logging.exception(f"Error HTTP /hoy: {e}")
-        await status_msg.edit_text("❌ Error al conectar con Flashscore en vivo. Intenta de nuevo en unos segundos, mi hermano.")
-        return
     if not partidos:
-        await status_msg.edit_text("⚠️ No encontré partidos en vivo ni programados en este momento, parcero. Puede que no haya juegos ahora o Flashscore bloqueó la lectura. Prueba enviando un enlace directo o intenta /hoy en 5 min.", reply_markup=kb_proactivo())
+        await status_msg.edit_text("⚠️ No encontré partidos en este momento, parcero. Prueba enviando un enlace directo.", reply_markup=kb_proactivo())
         return
-    # Guardar en FSM para callbacks
     await state.update_data(partidos_hoy=partidos)
     await status_msg.delete()
-    # Contadores para mensaje inteligente
-    cnt_vivo = sum(1 for p in partidos if p.get('isLive'))
-    cnt_prog = len(partidos) - cnt_vivo
     kb = InlineKeyboardMarkup(inline_keyboard=[])
     for idx, partido in enumerate(partidos):
-        # Prefijo visual según estado
         prefix = "🔴" if partido.get('isLive') else "⏰"
-        btn_text = partido['text']
-        if len(btn_text) > 38:
-            btn_text = btn_text[:35] + "…"
-        kb.inline_keyboard.append([InlineKeyboardButton(text=f"{prefix} {btn_text}", callback_data=f"hoy_{idx}")])
-    kb.inline_keyboard.append([InlineKeyboardButton(text="🔄 Actualizar", callback_data="hoy_refresh"), InlineKeyboardButton(text="❌ Cerrar", callback_data="hoy_close")])
-    header = f"🔥 *Top {len(partidos)} más atractivos del día — En vivo: {cnt_vivo} | Programados: {cnt_prog}*"
-    await message.answer(
-        f"{header}\n"
-        f"Prioricé Primera A / Ligas Pro, clásicos y partidos con más expectativa de goles. Formato: `62' [0-3] Equipo vs Equipo` = en vivo | `15:00 - Equipo vs Equipo` = próximo\n"
-        f"Toca uno, parcero, y te hago el análisis proactivo con lupa en alineaciones + casa recomendada (BetPlay/Wplay/Codere/Zamba):",
-        parse_mode="Markdown",
-        reply_markup=kb
-    )
+        kb.inline_keyboard.append([InlineKeyboardButton(text=f"{prefix} {partido['text'][:35]}", callback_data=f"hoy_{idx}")])
+    kb.inline_keyboard.append([InlineKeyboardButton(text="❌ Cerrar", callback_data="hoy_close")])
+    await message.answer("🔥 *Partidos destacados del día* — Toca uno para análisis proactivo:", parse_mode="Markdown", reply_markup=kb)
 
-# --- VISIÓN ARTIFICIAL: TIQUETE POR FOTO ---
 @router.message(F.photo)
 async def handle_ticket_photo(message: Message, bot: Bot, state: FSMContext):
     telegram_id = message.from_user.id
@@ -998,45 +839,28 @@ async def handle_ticket_photo(message: Message, bot: Bot, state: FSMContext):
             mime = "image/png"
         elif file.file_path.lower().endswith(".webp"):
             mime = "image/webp"
-        elif file.file_path.lower().endswith(".jpg") or file.file_path.lower().endswith(".jpeg"):
-            mime = "image/jpeg"
 
-        model = genai.GenerativeModel(model_name="gemini-2.5-flash")
+        model = genai.GenerativeModel(model_name=GEMINI_MODEL)
         prompt = (
             "Eres extractor experto de tiquetes de apuestas colombianas (BetPlay, Wplay, Codere, Zamba). "
-            "Analiza la captura de pantalla del tiquete y extrae JSON válido con: "
+            "Analiza la captura y extrae JSON válido: "
             '{"partido": "Equipo A vs Equipo B", "mercado": "Más de 2.5 goles", "cuota": 1.85}. '
-            "Si es combinada/parlay con varios partidos, concatena en partido y toma la cuota total. "
-            "Si no ves cuota, pon 0. Responde SOLO JSON, sin texto extra ni markdown."
+            "Responde SOLO JSON."
         )
         response = await gemini_generate_with_retry(model, [prompt, {"mime_type": mime, "data": image_bytes}])
         text = response.text.strip() if hasattr(response, "text") and response.text else ""
 
-        partido = mercado = None
+        partido, mercado = "Tiquete por foto", "Mercado por foto"
         cuota = 0.0
         try:
             json_match = re.search(r"\{.*\}", text, re.DOTALL)
             if json_match:
                 data_json = json.loads(json_match.group(0))
-                partido = str(data_json.get("partido", "")).strip() or "Tiquete por foto"
-                mercado = str(data_json.get("mercado", "")).strip() or "Mercado por foto"
+                partido = str(data_json.get("partido", "")).strip() or partido
+                mercado = str(data_json.get("mercado", "")).strip() or mercado
                 cuota = float(str(data_json.get("cuota", 0)).replace(",", "."))
-            else:
-                raise ValueError("No JSON")
         except Exception:
-            partido = "Tiquete por foto"
-            mercado = (text[:120].replace("\n", " ").strip() if text else "Mercado por foto")
-            m = re.search(r"(\d+[.,]\d+)", text)
-            if m:
-                try:
-                    cuota = float(m.group(1).replace(",", "."))
-                except Exception:
-                    cuota = 0.0
-
-        if not partido:
-            partido = "Tiquete por foto"
-        if not mercado:
-            mercado = "Mercado por foto"
+            pass
 
         fecha_now = datetime.now().strftime("%Y-%m-%d %H:%M")
         conn = sqlite3.connect(DB_NAME)
@@ -1049,21 +873,8 @@ async def handle_ticket_photo(message: Message, bot: Bot, state: FSMContext):
         hid = cursor.lastrowid
         conn.close()
 
-        banca = get_banca(telegram_id)
-        if banca and banca > 0:
-            stake2 = banca * 0.02
-            stake3 = banca * 0.03
-            stake_msg = f"\n💰 Banca {format_pesos(banca)} → 2% {format_pesos(stake2)} | 3% {format_pesos(stake3)}\n👉 Sugerido: {format_pesos(stake3)} (3% valor)"
-        else:
-            stake_msg = "\n💡 Configura tu banca con /banca 200000 para cálculo de stake"
-
         await processing.edit_text(
-            f"📸 *¡Tiquete leído, mi hermano!* ✅\n\n"
-            f"🏟️ Partido: {partido}\n"
-            f"🎯 Mercado: {mercado}\n"
-            f"💵 Cuota: {cuota:.2f}\n\n"
-            f"📝 Guardado en historial como `#{hid}` ⏳ Pendiente — ver con /historial"
-            f"{stake_msg}",
+            f"📸 *¡Tiquete leído, mi hermano!* ✅\n\n🏟️ Partido: {partido}\n🎯 Mercado: {mercado}\n💵 Cuota: {cuota:.2f}\n\n📝 Guardado en historial `#{hid}` ⏳",
             parse_mode="Markdown",
             reply_markup=kb_cuota()
         )
@@ -1071,171 +882,92 @@ async def handle_ticket_photo(message: Message, bot: Bot, state: FSMContext):
         await state.set_state(AnalysisStates.waiting_for_quota_or_chat)
     except Exception as e:
         logging.exception(f"Error visión tiquete: {e}")
-        await processing.edit_text("❌ No pude leer tu tiquete, parcero. Asegúrate que la foto sea nítida (que se vean BetPlay/Wplay/Codere/Zamba, partido, mercado y cuota) y reenvíala sin recortar la cuota total.")
+        await processing.edit_text("❌ No pude leer tu tiquete, parcero. Asegúrate que la foto sea nítida.")
 
 async def procesar_combinada(message: Message, state: FSMContext):
     telegram_id = message.from_user.id
     data = await state.get_data()
     partidos = data.get("partidos_combinada", [])
-    if not partidos:
-        await message.answer("⚠️ No has agregado partidos, parcero. Usa /combinada y envía al menos 2 enlaces.", reply_markup=kb_combinada())
-        return
     if len(partidos) < 2:
-        await message.answer(f"⚠️ Llevas solo {len(partidos)} partido. Para combinada necesitas mínimo 2. Envía otro enlace.", reply_markup=kb_combinada())
+        await message.answer("⚠️ Para combinada necesitas mínimo 2 partidos. Envía otro enlace.", reply_markup=kb_combinada())
         return
     allowed, err_msg = check_user_access(telegram_id)
     if not allowed:
         await message.answer(err_msg)
         return
-    status_msg = await message.answer(f"🔍 Procesando combinada de {len(partidos)} partidos... vía HTTP ligero (FotMob/Flashscore)")
+    status_msg = await message.answer(f"🔍 Procesando combinada de {len(partidos)} partidos...")
     textos_combinados = []
     for idx, url in enumerate(partidos, 1):
         try:
             txt, minute, score = await fetch_match_data(url)
-            if not txt or len(txt.strip()) < 80:
-                txt = f"[Datos limitados para {url}]"
-            header = f"MINUTO: {minute or 'No iniciado'} | MARCADOR: {score or '0-0'}"
-            textos_combinados.append(f"--- PARTIDO {idx}: {url} ---\n{header}\n{txt[:2500]}")
-            await asyncio.sleep(random.uniform(0.4, 0.9))
-        except Exception as e:
-            logging.exception(f"Error HTTP combinada {idx}: {e}")
-            textos_combinados.append(f"--- PARTIDO {idx}: {url} ---\n[Error HTTP]")
-    if not textos_combinados:
-        await status_msg.edit_text("❌ No se pudo extraer datos.")
-        return
-    await status_msg.edit_text("📊 Datos leídos. Calculando viabilidad conjunta del parlay...")
+            textos_combinados.append(f"--- PARTIDO {idx}: {url} ---\n{txt[:2500]}")
+        except Exception:
+            textos_combinados.append(f"--- PARTIDO {idx}: {url} ---\n[Error]")
     try:
-        model = genai.GenerativeModel(model_name="gemini-2.5-flash", system_instruction=SYSTEM_INSTRUCTION_COMBINADA)
-        prompt = f"Datos combinados para Combinada/Parlay (Flashscore/FotMob) de {len(partidos)} partidos:\n\n" + "\n\n".join(textos_combinados)
-        prompt += "\n\nRecuerda: revisa alineaciones y bajas, no inventes cuotas, 1 línea por selección, indica casa y viabilidad conjunta."
+        model = genai.GenerativeModel(model_name=GEMINI_MODEL, system_instruction=SYSTEM_INSTRUCTION_COMBINADA)
+        prompt = f"Datos combinados para Parlay de {len(partidos)} partidos:\n\n" + "\n\n".join(textos_combinados)
         response = await gemini_generate_with_retry(model, prompt)
         result = response.text.strip() if hasattr(response, "text") and response.text else str(response)
         increment_user_usage(telegram_id)
-        combinado_text = "\n\n".join(textos_combinados)
-        await state.update_data(scraped_text=combinado_text, last_url=f"Combinada {len(partidos)} partidos")
+        await state.update_data(scraped_text="\n".join(textos_combinados), last_url=f"Combinada {len(partidos)} partidos")
         await state.set_state(AnalysisStates.waiting_for_quota_or_chat)
-        await message.answer(result + f"\n\n✅ Combinada procesada. Descontado 1 uso de tus 10 diarios.", reply_markup=kb_cuota())
+        await message.answer(result + "\n\n✅ Combinada procesada.", reply_markup=kb_cuota())
         await status_msg.delete()
     except Exception as e:
         logging.error(f'Gemini API Error Detail: {e}')
-        logging.exception(f"Gemini traceback: {e}")
-        await status_msg.edit_text("❌ Error al calcular la combinada con Gemini. Intenta de nuevo, parcero.")
+        await status_msg.edit_text("❌ Error al calcular la combinada con Gemini.")
 
-# --- CALLBACKS INLINE KEYBOARDS ---
 @router.callback_query(F.data == "ver_historial")
 async def cb_ver_historial(callback: CallbackQuery):
     await callback.answer()
-    telegram_id = callback.from_user.id
-    allowed, err_msg = check_user_valid(telegram_id)
-    if not allowed:
-        await callback.message.answer(err_msg)
-        return
-    text = get_historial_text(telegram_id)
-    await callback.message.answer(text, parse_mode="Markdown")
+    await callback.message.answer(get_historial_text(callback.from_user.id), parse_mode="Markdown")
 
 @router.callback_query(F.data == "consultar_banca")
 async def cb_consultar_banca(callback: CallbackQuery):
     await callback.answer()
-    telegram_id = callback.from_user.id
-    allowed, err_msg = check_user_valid(telegram_id)
-    if not allowed:
-        await callback.message.answer(err_msg)
-        return
-    await callback.message.answer(get_banca_text(telegram_id), parse_mode="Markdown")
+    await callback.message.answer(get_banca_text(callback.from_user.id), parse_mode="Markdown")
 
 @router.callback_query(F.data == "modo_combinada")
 async def cb_modo_combinada(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
-    # Reusar lógica de /combinada
-    telegram_id = callback.from_user.id
-    allowed, err_msg = check_user_access(telegram_id)
-    if not allowed:
-        await callback.message.answer(err_msg)
-        return
     await state.set_state(AnalysisStates.collecting_combinada)
     await state.update_data(partidos_combinada=[])
-    await callback.message.answer(
-        "🎯 *Modo Combinada activado!*\nEnvíame enlaces de Flashscore/FotMob uno por uno.\nCuando termines pulsa 🔥 Calcular Parlay.",
-        parse_mode="Markdown",
-        reply_markup=kb_combinada()
-    )
+    await callback.message.answer("🎯 *Modo Combinada activado!*\nEnvíame enlaces uno por uno.", parse_mode="Markdown", reply_markup=kb_combinada())
 
 @router.callback_query(F.data == "agregar_otro")
 async def cb_agregar_otro(callback: CallbackQuery):
-    await callback.answer("Envíame el siguiente enlace de Flashscore, parcero 📎", show_alert=False)
-    await callback.message.answer("📎 Listo, parcero — envíame el siguiente enlace de Flashscore para la combinada.\nLlevas tiempo, sin afán. Cuando termines pulsa 🔥 Calcular Parlay.", reply_markup=kb_combinada())
+    await callback.answer("Envía el siguiente enlace", show_alert=False)
+    await callback.message.answer("📎 Envía el siguiente enlace de Flashscore.", reply_markup=kb_combinada())
 
 @router.callback_query(F.data == "calcular_parlay")
 async def cb_calcular_parlay(callback: CallbackQuery, state: FSMContext):
-    await callback.answer("Calculando parlay, mi hermano... ⏳")
-    # Crear un mensaje ficticio para procesar_combinada (usa callback.message como contexto)
+    await callback.answer("Calculando parlay... ⏳")
     await procesar_combinada(callback.message, state)
 
 @router.callback_query(F.data == "cancelar_combinada")
 async def cb_cancelar_combinada(callback: CallbackQuery, state: FSMContext):
-    await callback.answer("Combinada cancelada")
-    await state.update_data(partidos_combinada=[])
+    await callback.answer("Cancelado")
     await state.set_state(AnalysisStates.waiting_for_link)
-    await callback.message.answer("❌ Combinada cancelada. Modo normal activado, parcero.", reply_markup=kb_proactivo())
-    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer("❌ Combinada cancelada.", reply_markup=kb_proactivo())
 
-# --- CALLBACKS HOY / EN VIVO ---
 @router.callback_query(F.data.startswith("hoy_"))
 async def cb_hoy_selector(callback: CallbackQuery, state: FSMContext):
     data = callback.data
-    if data == "hoy_refresh":
-        await callback.answer("Actualizando... ⏳")
-        try:
-            await callback.message.delete()
-        except Exception:
-            pass
-        # Re-ejecutar /hoy correctamente con el usuario que clickeó
-        # Usamos el mismo callback.message pero forzamos el check con callback.from_user
-        class _FakeMsg:
-            def __init__(self, msg, user):
-                self._msg = msg
-                self.from_user = user
-                self.chat = msg.chat
-            def __getattr__(self, name):
-                return getattr(self._msg, name)
-            async def answer(self, *a, **kw):
-                return await self._msg.answer(*a, **kw)
-        fake = _FakeMsg(callback.message, callback.from_user)
-        await cmd_hoy(fake, state)
-        return
     if data == "hoy_close":
         await callback.answer()
-        try:
-            await callback.message.edit_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-        await callback.message.answer("✅ Cerrado, parcero. Usa /hoy cuando quieras ver los en vivo.", reply_markup=kb_proactivo())
+        await callback.message.answer("✅ Cerrado.", reply_markup=kb_proactivo())
         return
-    # Caso hoy_0, hoy_1 ... -> análisis proactivo
     if data.startswith("hoy_") and data[4:].isdigit():
-        try:
-            idx = int(data.split("_")[1])
-        except Exception:
-            await callback.answer("Error al leer partido")
-            return
+        idx = int(data.split("_")[1])
         fsm_data = await state.get_data()
         partidos = fsm_data.get("partidos_hoy", [])
         if idx < 0 or idx >= len(partidos):
-            await callback.answer("Partido ya no disponible, actualiza con /hoy", show_alert=True)
+            await callback.answer("Partido no disponible", show_alert=True)
             return
         url = partidos[idx].get("href")
-        nombre = partidos[idx].get("text", f"Partido {idx+1}")
-        await callback.answer(f"Analizando {nombre[:25]}... ⏳")
-        try:
-            await callback.message.edit_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-        await callback.message.answer(f"⚽ Elegiste: *{nombre}*\n🔗 {url}\n\nIniciando análisis proactivo...", parse_mode="Markdown")
+        await callback.answer("Analizando... ⏳")
         await ejecutar_analisis_proactivo(url, callback.message, state)
-        return
-    await callback.answer()
 
-# --- Flujo principal proactivo ---
 @router.message(F.text & ~F.text.startswith("/"))
 async def handle_user_flow(message: Message, state: FSMContext):
     current_state = await state.get_state()
@@ -1244,40 +976,19 @@ async def handle_user_flow(message: Message, state: FSMContext):
     text_lower = text.lower()
 
     if current_state == AnalysisStates.collecting_combinada.state:
-        if text_lower in ("listo", "listo!", "calcular", "calcular_combinada"):
+        if text_lower in ("listo", "calcular", "calcular_combinada"):
             await procesar_combinada(message, state)
             return
         if "flashscore" in text_lower or "fotmob" in text_lower:
             data = await state.get_data()
             partidos = data.get("partidos_combinada", [])
-            if text in partidos:
-                await message.answer(f"⚠️ Ese partido ya está agregado. Llevas {len(partidos)}: envía otro diferente.", reply_markup=kb_combinada())
-                return
             partidos.append(text)
             await state.update_data(partidos_combinada=partidos)
-            await message.answer(
-                f"✅ Partido {len(partidos)} agregado.\n"
-                f"📋 Llevas {len(partidos)} en la combinada.",
-                reply_markup=kb_combinada()
-            )
+            await message.answer(f"✅ Partido agregado ({len(partidos)}).", reply_markup=kb_combinada())
             return
-        await message.answer(
-            f"🎯 Modo Combinada: llevas {len((await state.get_data()).get('partidos_combinada', []))} partidos.\n"
-            f"Envíame enlaces de Flashscore/FotMob.",
-            reply_markup=kb_combinada()
-        )
         return
 
-    # === PRIORIDAD 1: Análisis Individual (fuera de combinada) ===
-    # Si es enlace Flashscore y NO está en modo combinada, ejecutar análisis individual de inmediato
-    if "flashscore" in text_lower or "fotmob" in text_lower and current_state != AnalysisStates.collecting_combinada.state:
-        # No confundirse con estados previos (waiting_for_quota_or_chat), va directo a flujo individual abajo
-        pass
-    elif current_state in (AnalysisStates.waiting_for_quota_or_chat.state, AnalysisStates.waiting_for_quota.state):
-        # === CAPTURA DE SELECCIÓN POST-PROACTIVO ===
-        # El bot acaba de enviar "¿Cuál te gusta o qué cuota te ofrece tu casa...?" y queda a la espera.
-        # Cualquier respuesta con mercado/cuota (ej. "me fui con los córners del Everton a 1.65") se procesa aquí:
-        # -> calcula EV, stake 2%/3% según banca_actual y guarda en historial_apuestas como PENDIENTE
+    if current_state in (AnalysisStates.waiting_for_quota_or_chat.state, AnalysisStates.waiting_for_quota.state):
         if text_lower.startswith("combinada"):
             await cmd_combinada(message, state)
             return
@@ -1288,35 +999,25 @@ async def handle_user_flow(message: Message, state: FSMContext):
     if not allowed:
         await message.answer(err_msg)
         return
-    url = text
-    if "flashscore" not in url.lower() and "fotmob" not in url.lower():
-        if url.startswith("http"):
-            await message.answer("⚠️ Por favor envía un enlace válido de Flashscore o FotMob (debe contener 'flashscore' o 'fotmob').\nSi quieres evaluar una cuota escríbela así: `1.90 al ambos anotan`\n🎯 Para parlays usa /combinada", reply_markup=kb_proactivo())
+    if "flashscore" not in text.lower() and "fotmob" not in text.lower():
+        await message.answer("⚠️ Envía un enlace válido de Flashscore o FotMob.", reply_markup=kb_proactivo())
         return
-    status_msg = await message.answer("🔍 Enlace válido, parcero. Extrayendo vía HTTP ligero (sin navegador)...", reply_markup=kb_proactivo())
+    
+    status_msg = await message.answer("🔍 Enlace válido, parcero. Extrayendo...", reply_markup=kb_proactivo())
     try:
-        scraped_text, minute_live, score_live = await fetch_match_data(url)
+        scraped_text, minute_live, score_live = await fetch_match_data(text)
         if not scraped_text or len(scraped_text.strip()) < 150:
-            await status_msg.edit_text("❌ Flashscore bloqueó la lectura del partido, intenta de nuevo")
+            await status_msg.edit_text("❌ Flashscore bloqueó la lectura, intenta de nuevo")
             return
-        _low = scraped_text.lower()
-        _has_stats = any(k in _low for k in ["h2h", "historial", "alineación", "alineacion", "árbitro", "arbitro", "estadística", "estadistica", "head to head", "corners", "córners", "posesión", "posesion", "tarjetas", "goles", "formation", "lineup"])
-        if len(scraped_text.strip()) < 150 or not _has_stats:
-            await status_msg.edit_text("❌ Flashscore bloqueó la lectura del partido, intenta de nuevo")
-            return
-        # scraped_text ya trae Estado/Minuto/Marcador formateados correctamente desde fetch_match_data - no reconstruir live_header
-    except Exception as e:
-        logging.exception(f"Error HTTP ligero: {e}")
-        await status_msg.edit_text("❌ Error al extraer datos del partido. Intenta de nuevo, parcero.")
+    except Exception:
+        await status_msg.edit_text("❌ Error al extraer datos del partido.")
         return
-    if not scraped_text.strip():
-        await status_msg.edit_text("❌ No se pudo extraer contenido. El sitio puede estar bloqueando.")
-        return
-    await state.update_data(scraped_text=scraped_text, last_url=url, minute_live=minute_live, score_live=score_live)
-    await status_msg.edit_text(f"📊 Datos listos. Analizando con lupa alineaciones y bajas...")
+
+    await state.update_data(scraped_text=scraped_text, last_url=text)
+    await status_msg.edit_text("📊 Analizando con lupa...")
     try:
-        model = genai.GenerativeModel(model_name="gemini-2.5-flash", system_instruction=SYSTEM_INSTRUCTION)
-        prompt = f"Datos extraídos (Flashscore/FotMob) - Partido: {url}\n\n{scraped_text}\n\nUsa el Estado/Minuto/Marcador del texto para decidir: si >75' o marcador abultado, prohíbe mercados obsoletos."
+        model = genai.GenerativeModel(model_name=GEMINI_MODEL, system_instruction=SYSTEM_INSTRUCTION)
+        prompt = f"Datos del partido:\n\n{scraped_text}"
         response = await gemini_generate_with_retry(model, prompt)
         analysis_result = response.text.strip() if hasattr(response, "text") and response.text else str(response)
         increment_user_usage(telegram_id)
@@ -1324,98 +1025,57 @@ async def handle_user_flow(message: Message, state: FSMContext):
         await state.set_state(AnalysisStates.waiting_for_quota_or_chat)
     except Exception as e:
         logging.error(f'Gemini API Error Detail: {e}')
-        logging.exception(f"Gemini traceback: {e}")
-        await message.answer("❌ Error al conectar con Gemini para el análisis proactivo. Intenta de nuevo en unos segundos, parcero.", reply_markup=kb_proactivo())
+        await message.answer("❌ Error al conectar con Gemini. Intenta de nuevo.", reply_markup=kb_proactivo())
         await state.set_state(AnalysisStates.waiting_for_quota_or_chat)
 
 async def process_quota_chat(message: Message, state: FSMContext):
-    """Captura la elección del usuario post-proactivo, calcula EV + stake y guarda en historial como PENDIENTE."""
     telegram_id = message.from_user.id
-    allowed, err_msg = check_user_valid(telegram_id)
-    if not allowed:
-        await message.answer(err_msg)
-        return
-    # Captura de la elección: puede ser "me fui con los córners del Everton a 1.65" o "1.90 ambos anotan"
     quota_input = message.text.strip()
     data = await state.get_data()
     scraped_text = data.get("scraped_text", "")
-    last_url = data.get("last_url", "partido anterior")
+    last_url = data.get("last_url", "partido")
     if not scraped_text:
-        await message.answer("⚠️ No tengo contexto del partido, mi hermano. Envíame primero un enlace de Flashscore/FotMob y luego evaluamos la cuota que quieras.", reply_markup=kb_proactivo())
+        await message.answer("⚠️ Envía primero un enlace de partido.", reply_markup=kb_proactivo())
         await state.set_state(AnalysisStates.waiting_for_link)
         return
-    if len(quota_input) < 3:
-        await message.answer("Pilas pues, dime la cuota y mercado: ej. `1.90 al ambos anotan` o `2.10 en +4.5 tarjetas` y te digo si hay valor o si nos quemamos.", reply_markup=kb_proactivo())
-        return
-    processing_msg = await message.answer("🤖 Analizando tu elección, parcero... calculando EV y stake...")
+    processing_msg = await message.answer("🤖 Evaluando tu cuota...")
     try:
-        model = genai.GenerativeModel(model_name="gemini-2.5-flash", system_instruction=SYSTEM_INSTRUCTION_CUOTA)
-        prompt = (
-            f"Contexto del partido (Flashscore/FotMob - {last_url}):\n{scraped_text}\n\n"
-            f"Consulta del usuario - Cuota y mercado a evaluar (BetPlay/Wplay/Codere/Zamba):\n{quota_input}\n\n"
-            f"Recuerda: revisa alineaciones y bajas con lupa, calcula 1/Cuota, EV >5% = VALOR. Menciona casa recomendada (BetPlay, Wplay, Codere o Zamba)."
-        )
+        model = genai.GenerativeModel(model_name=GEMINI_MODEL, system_instruction=SYSTEM_INSTRUCTION_CUOTA)
+        prompt = f"Contexto:\n{scraped_text}\n\nCuota elegida:\n{quota_input}"
         response = await gemini_generate_with_retry(model, prompt)
         result = response.text.strip() if hasattr(response, "text") and response.text else str(response)
+        
+        cuota_val = 0.0
         try:
             match = re.search(r"(\d+[.,]\d+)", quota_input)
             if match:
                 cuota_val = float(match.group(1).replace(",", "."))
-            else:
-                m2 = re.search(r"(\d+)", quota_input)
-                cuota_val = float(m2.group(1)) if m2 else 0.0
-            mercado_txt = quota_input[:120].strip()
-            partido_txt = last_url[:300] if last_url else scraped_text[:80]
-            fecha_now = datetime.now().strftime("%Y-%m-%d %H:%M")
-            conn = sqlite3.connect(DB_NAME)
-            cursor = conn.cursor()
-            cursor.execute("""
-                INSERT INTO historial_apuestas (telegram_id, partido, mercado, cuota, estado, fecha)
-                VALUES (?, ?, ?, ?, 'PENDIENTE', ?)
-            """, (telegram_id, partido_txt, mercado_txt, cuota_val, fecha_now))
-            conn.commit()
-            historial_id = cursor.lastrowid
-            conn.close()
-        except Exception as e:
-            logging.exception(f"Error guardando historial: {e}")
-            historial_id = None
+        except Exception:
+            pass
+
+        fecha_now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO historial_apuestas (telegram_id, partido, mercado, cuota, estado, fecha) VALUES (?, ?, ?, ?, 'PENDIENTE', ?)", 
+                       (telegram_id, last_url[:300], quota_input[:120], cuota_val, fecha_now))
+        conn.commit()
+        hid = cursor.lastrowid
+        conn.close()
+
         banca = get_banca(telegram_id)
-        stake_msg = ""
-        es_valor = "🟢" in result or "METALE" in result.upper() or "CONFIANZA" in result.upper()
-        if banca and banca > 0:
-            stake2 = banca * 0.02
-            stake3 = banca * 0.03
-            sugerido = stake3 if es_valor else stake2
-            stake_msg = (
-                f"\n\n💰 Banca {format_pesos(banca)} → Stake prudente: 2% {format_pesos(stake2)} | 3% {format_pesos(stake3)}\n"
-                f"👉 Sugerido para esta: {format_pesos(sugerido)} ({'3% valor' if es_valor else '2% conservador'})"
-            )
-        else:
-            stake_msg = "\n\n💡 ¿Quieres que te calcule cuánto apostar? Configura tu banca: `/banca 200000`"
-        historial_msg = f"\n\n📝 Guardado en historial como `#{historial_id}` ⏳ Pendiente" if historial_id else ""
-        await processing_msg.edit_text(result + stake_msg + historial_msg, parse_mode="Markdown")
-        # Teclado post-evaluación con historial y casas
+        stake_msg = f"\n\n📝 Guardado en historial `#{hid}` ⏳"
+        if banca > 0:
+            stake_msg += f"\n💰 Sugerido Stake (3%): {format_pesos(banca*0.03)}"
+
+        await processing_msg.edit_text(result + stake_msg, parse_mode="Markdown")
         await message.answer("¿Qué hacemos ahora, parcero?", reply_markup=kb_cuota())
         await state.set_state(AnalysisStates.waiting_for_quota_or_chat)
     except Exception as e:
         logging.error(f'Gemini API Error Detail: {e}')
-        logging.exception(f"Gemini traceback: {e}")
-        await processing_msg.edit_text("❌ Error al evaluar la cuota con Gemini. Intenta de nuevo, mi hermano.")
+        await processing_msg.edit_text("❌ Error al evaluar la cuota.")
 
 # ==========================================
-# 6. MAIN - Arranque del bot
-# ==========================================
-async def main():
-    init_db()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-    bot = Bot(token=TELEGRAM_TOKEN)
-    dp = Dispatcher(storage=MemoryStorage())
-    dp.include_router(router)
-    logging.info("Bot iniciado correctamente (aiogram v3.x) - Inline Keyboards + Historial")
-    await dp.start_polling(bot)
-
-# ==========================================
-# 7. SERVIDOR WEB FALSO PARA RENDER (evita Timed Out)
+# 6. MAIN & FLASK
 # ==========================================
 import threading
 from flask import Flask
@@ -1429,6 +1089,15 @@ def home():
 def run_web():
     port = int(os.getenv('PORT', 10000))
     web_app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+
+async def main():
+    init_db()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    bot = Bot(token=TELEGRAM_TOKEN)
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(router)
+    logging.info("Bot iniciado correctamente (aiogram v3.x)")
+    await dp.start_polling(bot)
 
 if __name__ == '__main__':
     web_thread = threading.Thread(target=run_web, daemon=True)
