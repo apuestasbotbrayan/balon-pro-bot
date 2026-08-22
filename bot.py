@@ -861,7 +861,7 @@ async def ejecutar_analisis_proactivo(url: str, message: Message, state: FSMCont
     await state.update_data(scraped_text=scraped_text, last_url=url, minute_live=minute_live, score_live=score_live)
     await status_msg.edit_text(f"📊 Datos listos. Analizando con lupa alineaciones y bajas...")
     try:
-        model = genai.GenerativeModel(model_name="gemini-2.5-flash", system_instruction=SYSTEM_INSTRUCTION)
+        model = genai.GenerativeModel(model_name="gemini-3.6-flash", system_instruction=SYSTEM_INSTRUCTION)
         prompt = f"Datos extraídos (Flashscore/FotMob) - Partido: {url}\n\n{scraped_text}\n\nUsa el Estado/Minuto/Marcador del texto para decidir: si >75' o marcador abultado, prohíbe mercados obsoletos."
         response = await asyncio.to_thread(model.generate_content, prompt)
         analysis_result = response.text.strip() if hasattr(response, "text") and response.text else str(response)
@@ -1087,7 +1087,7 @@ async def handle_ticket_photo(message: Message, bot: Bot, state: FSMContext):
         elif file.file_path.lower().endswith(".jpg") or file.file_path.lower().endswith(".jpeg"):
             mime = "image/jpeg"
 
-        model = genai.GenerativeModel(model_name="gemini-2.5-flash")
+        model = genai.GenerativeModel(model_name="gemini-3.6-flash")
         prompt = (
             "Eres extractor experto de tiquetes de apuestas colombianas (BetPlay, Wplay, Codere, Zamba). "
             "Analiza la captura de pantalla del tiquete y extrae JSON válido con: "
@@ -1191,7 +1191,7 @@ async def procesar_combinada(message: Message, state: FSMContext):
         return
     await status_msg.edit_text("📊 Datos leídos. Calculando viabilidad conjunta del parlay...")
     try:
-        model = genai.GenerativeModel(model_name="gemini-2.5-flash", system_instruction=SYSTEM_INSTRUCTION_COMBINADA)
+        model = genai.GenerativeModel(model_name="gemini-3.6-flash", system_instruction=SYSTEM_INSTRUCTION_COMBINADA)
         prompt = f"Datos combinados para Combinada/Parlay (Flashscore/FotMob) de {len(partidos)} partidos:\n\n" + "\n\n".join(textos_combinados)
         prompt += "\n\nRecuerda: revisa alineaciones y bajas, no inventes cuotas, 1 línea por selección, indica casa y viabilidad conjunta."
         response = await asyncio.to_thread(model.generate_content, prompt)
@@ -1401,7 +1401,7 @@ async def handle_user_flow(message: Message, state: FSMContext):
     await state.update_data(scraped_text=scraped_text, last_url=url, minute_live=minute_live, score_live=score_live)
     await status_msg.edit_text(f"📊 Datos listos. Analizando con lupa alineaciones y bajas...")
     try:
-        model = genai.GenerativeModel(model_name="gemini-2.5-flash", system_instruction=SYSTEM_INSTRUCTION)
+        model = genai.GenerativeModel(model_name="gemini-3.6-flash", system_instruction=SYSTEM_INSTRUCTION)
         prompt = f"Datos extraídos (Flashscore/FotMob) - Partido: {url}\n\n{scraped_text}\n\nUsa el Estado/Minuto/Marcador del texto para decidir: si >75' o marcador abultado, prohíbe mercados obsoletos."
         response = await asyncio.to_thread(model.generate_content, prompt)
         analysis_result = response.text.strip() if hasattr(response, "text") and response.text else str(response)
@@ -1435,7 +1435,7 @@ async def process_quota_chat(message: Message, state: FSMContext):
         return
     processing_msg = await message.answer("🤖 Analizando tu elección, parcero... calculando EV y stake...")
     try:
-        model = genai.GenerativeModel(model_name="gemini-2.5-flash", system_instruction=SYSTEM_INSTRUCTION_CUOTA)
+        model = genai.GenerativeModel(model_name="gemini-3.6-flash", system_instruction=SYSTEM_INSTRUCTION_CUOTA)
         prompt = (
             f"Contexto del partido (Flashscore/FotMob - {last_url}):\n{scraped_text}\n\n"
             f"Consulta del usuario - Cuota y mercado a evaluar (BetPlay/Wplay/Codere/Zamba):\n{quota_input}\n\n"
