@@ -3,3 +3,6 @@ google-generativeai==0.8.4
 playwright==1.48.0
 flask==3.0.3
 playwright-stealth==1.0.6
+curl_cffi==0.7.0
+requests==2.32.3
+beautifulsoup4==4.12.3

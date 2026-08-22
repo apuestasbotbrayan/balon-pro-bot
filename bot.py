@@ -20,6 +20,119 @@ import google.generativeai as genai
 from playwright.async_api import async_playwright
 from playwright_stealth import stealth_async
 
+# HTTP ligero para evadir Cloudflare sin navegador (curl_cffi impersonate Chrome)
+try:
+    from curl_cffi import requests as curl_requests
+    HAS_CURL = True
+except ImportError:
+    curl_requests = None
+    HAS_CURL = False
+import requests as req_requests
+try:
+    from bs4 import BeautifulSoup
+    HAS_BS4 = True
+except ImportError:
+    HAS_BS4 = False
+
+HEADERS_CHROME = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Sec-Ch-Ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Upgrade-Insecure-Requests": "1",
+    "Referer": "https://www.flashscore.co/",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+}
+
+def _to_mobile_url(url: str) -> str:
+    if "flashscore.co/partido/" in url:
+        return url.replace("www.flashscore.co/partido", "m.flashscore.co/partido").replace("www.flashscore.co", "m.flashscore.co")
+    if "flashscore.com/match/" in url:
+        return url.replace("www.flashscore.com", "m.flashscore.com")
+    return url
+
+async def fetch_flashscore_text(url: str) -> tuple[str, str, str]:
+    """HTTP ligero sin Playwright: retorna (texto_limpio, minute, score). Prueba curl_cffi impersonate + fallback requests + URL móvil."""
+    def _fetch(u: str) -> str:
+        headers = dict(HEADERS_CHROME)
+        # Intentar curl_cffi con impersonate Chrome (mejor TLS fingerprint)
+        if HAS_CURL and curl_requests is not None:
+            try:
+                resp = curl_requests.get(u, headers=headers, impersonate="chrome110", timeout=15000)
+                if resp.status_code == 200 and len(resp.text) > 500:
+                    return resp.text
+            except Exception:
+                pass
+        # Fallback requests
+        try:
+            resp = req_requests.get(u, headers=headers, timeout=15000)
+            if resp.status_code == 200 and len(resp.text) > 500:
+                return resp.text
+        except Exception:
+            pass
+        return ""
+
+    def _extract(html: str) -> tuple[str, str, str]:
+        if not html:
+            return "", "", ""
+        text = ""
+        minute = ""
+        score = ""
+        if HAS_BS4:
+            try:
+                soup = BeautifulSoup(html, "html.parser")
+                # Eliminar scripts/styles
+                for tag in soup(["script", "style", "noscript"]):
+                    tag.decompose()
+                # Intentar contenedor específico #detail
+                detail = soup.select_one("#detail, .container__detail")
+                if detail:
+                    text = detail.get_text(separator="\n", strip=True)
+                else:
+                    text = soup.get_text(separator="\n", strip=True)
+            except Exception:
+                text = re.sub(r"<[^>]+>", "\n", html)
+        else:
+            text = re.sub(r"<[^>]+>", "\n", html)
+        # Limpiar
+        text = re.sub(r"\n{2,}", "\n", text).strip()[:4000]
+        # Extraer minuto y marcador del texto limpio
+        m = re.search(r"\b\d{1,3}(?:\+\d+)?'\b", text)
+        if m:
+            minute = m.group(0)
+        s = re.search(r"\b\d+\s*[-:]\s*\d+\b", text)
+        if s:
+            score = s.group(0).replace(" ", "").replace(":", "-")
+        return text, minute, score
+
+    # Intentar URL original y luego móvil
+    candidates = [url, _to_mobile_url(url)]
+    # Para /hoy lista, la principal ya es https://www.flashscore.co/
+    for cand in candidates:
+        html = await asyncio.to_thread(_fetch, cand)
+        txt, minute, score = _extract(html)
+        _low = txt.lower()
+        has_stats = any(k in _low for k in ["h2h", "historial", "alineación", "alineacion", "árbitro", "arbitro", "estadística", "formation", "lineup", "corners", "goles", "tarjetas", "posesión"])
+        if len(txt.strip()) > 400 or has_stats:
+            return txt[:3000], minute, score
+        if len(txt.strip()) > 150:
+            # Guardar como último intento
+            last = (txt[:3000], minute, score)
+        else:
+            last = ("", "", "")
+    # Si no hay buen contenido, devolver último intento aunque sea corto (Gemini decidirá)
+    try:
+        return last
+    except Exception:
+        return "", "", ""
+
 # ==========================================
 # 1. CONFIGURACIÓN Y CREDENCIALES (con soporte para Render Env Vars)
 # ==========================================
@@ -511,79 +624,24 @@ async def ejecutar_analisis_proactivo(url: str, message: Message, state: FSMCont
     if not allowed:
         await message.answer(err_msg, reply_markup=kb_proactivo())
         return
-    status_msg = await message.answer("🔍 Enlace de partido en vivo seleccionado, parcero. Extrayendo con Playwright...", reply_markup=kb_proactivo())
-    scraped_text = ""
+    status_msg = await message.answer("🔍 Enlace seleccionado, parcero. Extrayendo vía HTTP ligero (sin navegador, evadiendo Cloudflare)...", reply_markup=kb_proactivo())
+    # HTTP directo con headers Chrome real + curl_cffi (TLS fingerprint) + fallback móvil
     try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled", "--disable-features=IsolateOrigins,site-per-process", "--disable-site-isolation-trials", "--window-size=1920,1080"])
-            context = await browser.new_context(viewport={"width": 1280, "height": 800}, locale="es-CO", extra_http_headers={"Accept-Language": "es-ES,es;q=0.9"}, java_script_enabled=True, ignore_https_errors=True)
-            page = await context.new_page()
-            await stealth_async(page)
-            await asyncio.sleep(random.uniform(1.0, 2.0))
-            await page.goto(url, timeout=30000, wait_until="domcontentloaded")
-            await page.mouse.move(100, 100)
-            await asyncio.sleep(random.uniform(2.0, 3.5))
-            # 1) Esperar contenedor específico #detail (funciona en vivo y pre-partido) - NO body
-            try:
-                await page.wait_for_selector('#detail, .container__detail', timeout=30000)
-            except Exception as e:
-                logging.warning(f"Flashscore bloqueó lectura (timeout #detail): {e}")
-                try:
-                    await browser.close()
-                except Exception:
-                    pass
-                await status_msg.edit_text("❌ Flashscore bloqueó la lectura del partido, intenta de nuevo")
-                return
-            # 2) Extraer SOLO datos reales del contenedor, no menú genérico
-            try:
-                try:
-                    body_text = await page.inner_text('#detail')
-                except Exception:
-                    body_text = await page.inner_text('.container__detail')
-            except Exception as e:
-                logging.warning(f"Flashscore bloqueó lectura (inner_text #detail): {e}")
-                try:
-                    await browser.close()
-                except Exception:
-                    pass
-                await status_msg.edit_text("❌ Flashscore bloqueó la lectura del partido, intenta de nuevo")
-                return
-            scraped_text = body_text[:3000]
-            _low = scraped_text.lower()
-            _has_stats = any(k in _low for k in ["h2h", "historial", "alineación", "alineacion", "árbitro", "arbitro", "estadística", "estadistica", "head to head", "corners", "córners", "posesión", "posesion", "tarjetas", "goles", "formation", "lineup"])
-            if len(scraped_text.strip()) < 150 or not _has_stats:
-                try:
-                    await browser.close()
-                except Exception:
-                    pass
-                await status_msg.edit_text("❌ Flashscore bloqueó la lectura del partido, intenta de nuevo")
-                return
-            # === EXTRACCIÓN OBLIGATORIA MINUTO Y MARCADOR EN VIVO ===
-            try:
-                live_info = await page.evaluate("""() => {
-                    const timeEl = document.querySelector('.event__time, .event__stage, .detailScore__time, [class*="event__time"], [class*="detailTime"]');
-                    const scoreEl = document.querySelector('.event__score, .detailScore__wrapper, .detailScore, [class*="event__score"], [class*="score"]');
-                    let minute = timeEl ? timeEl.innerText.trim() : '';
-                    let score = scoreEl ? scoreEl.innerText.trim().replace(/\\s+/g,' ') : '';
-                    if (!minute || !score) {
-                        const txt = document.body.innerText;
-                        const m = txt.match(/\\b\\d{1,3}(?:\\+\\d+)?'\\b/);
-                        if (m && !minute) minute = m[0];
-                        const s = txt.match(/\\b\\d+\\s*[-:]\\s*\\d+\\b/);
-                        if (s && !score) score = s[0].replace(/\\s+/g,'').replace(':','-');
-                    }
-                    return {minute: minute || '', score: score || ''};
-                }""")
-                minute_live = live_info.get('minute', '').strip() if isinstance(live_info, dict) else ''
-                score_live = live_info.get('score', '').strip() if isinstance(live_info, dict) else ''
-            except Exception:
-                minute_live = ''
-                score_live = ''
-            live_header = f"MINUTO ACTUAL: {minute_live if minute_live else 'No iniciado / Sin dato'} | MARCADOR EN VIVO: {score_live if score_live else ('0-0 (programado)' if not minute_live else 'No detectado')}"
-            await browser.close()
+        scraped_text, minute_live, score_live = await fetch_flashscore_text(url)
+        # Si HTTP no trajo stats, intentar móvil ya está dentro de fetch
+        if not scraped_text or len(scraped_text.strip()) < 150:
+            await status_msg.edit_text("❌ Flashscore bloqueó la lectura del partido, intenta de nuevo")
+            return
+        _low = scraped_text.lower()
+        _has_stats = any(k in _low for k in ["h2h", "historial", "alineación", "alineacion", "árbitro", "arbitro", "estadística", "estadistica", "head to head", "corners", "córners", "posesión", "posesion", "tarjetas", "goles", "formation", "lineup"])
+        if len(scraped_text.strip()) < 150 or not _has_stats:
+            # Enviar igual a Gemini si tiene algo, pero advertir; por ahora abortar para no gastar tokens en basura
+            await status_msg.edit_text("❌ Flashscore bloqueó la lectura del partido, intenta de nuevo")
+            return
+        live_header = f"MINUTO ACTUAL: {minute_live if minute_live else 'No iniciado / Sin dato'} | MARCADOR EN VIVO: {score_live if score_live else ('0-0 (programado)' if not minute_live else 'No detectado')}"
     except Exception as e:
-        logging.exception(f"Error Playwright hoy: {e}")
-        await status_msg.edit_text("❌ Error al extraer datos del partido en vivo. Intenta con otro enlace, mi hermano.")
+        logging.exception(f"Error HTTP ligero: {e}")
+        await status_msg.edit_text("❌ Error al extraer datos del partido. Intenta con otro enlace, mi hermano.")
         return
     if not scraped_text.strip():
         await status_msg.edit_text("❌ No se pudo extraer contenido del partido.")
@@ -614,207 +672,155 @@ async def cmd_hoy(message: Message, state: FSMContext):
     status_msg = await message.answer("🔍 Buscando partidos del día en Flashscore (en vivo + programados), parcero... filtrando los de mayor valor para ti ⏳")
     partidos = []
     try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled", "--disable-features=IsolateOrigins,site-per-process", "--disable-site-isolation-trials", "--window-size=1920,1080"])
-            context = await browser.new_context(viewport={"width": 1280, "height": 800}, locale="es-CO", extra_http_headers={"Accept-Language": "es-ES,es;q=0.9"}, java_script_enabled=True, ignore_https_errors=True)
-            page = await context.new_page()
-            await stealth_async(page)
-            await asyncio.sleep(random.uniform(1.0, 2.0))
-            await page.goto("https://www.flashscore.co/", timeout=30000, wait_until="domcontentloaded")
-            await page.mouse.move(100, 100)
-            await asyncio.sleep(random.uniform(4.0, 6.0))
-            try:
-                await page.wait_for_selector('.event__match, [id^="g_1"], .sportName', timeout=12000)
-            except Exception:
+        # HTTP ligero para lista del día (sin navegador) - curl_cffi con headers Chrome real
+        def _fetch_hoy(u: str) -> str:
+            headers = dict(HEADERS_CHROME)
+            if HAS_CURL and curl_requests is not None:
                 try:
-                    await page.wait_for_selector("body", timeout=5000)
+                    resp = curl_requests.get(u, headers=headers, impersonate="chrome110", timeout=15000)
+                    if resp.status_code == 200:
+                        return resp.text
                 except Exception:
                     pass
-            # Extraer TODOS los partidos del día con lógica de VALOR/RELEVANCIA
             try:
-                partidos = await page.evaluate("""() => {
-                    const seen = new Set();
-                    const raw = [];
-
-                    const getLeagueScore = (text) => {
-                        const t = (text || '').toUpperCase();
-                        if (/PRIMERA A|BETPLAY|DIMAYOR|COLOMBIA.*PRIMERA/.test(t)) return 100;
-                        if (/PREMIER LEAGUE|LA LIGA|LALIGA|SERIE A|BUNDESLIGA|LIGUE 1|CHAMPIONS|LIBERTADORES|EUROPA LEAGUE|BRASILEIRAO|SUDAMERICANA|LIGA MX|CLASICO|DERBY/.test(t)) return 95;
-                        if (/PRIMERA B|COPA LIBERTADORES|COPA SUDAMERICANA|EREDIVISIE|PRIMEIRA LIGA|CHAMPIONSHIP|MLS|ARGENTINA.*PRIMERA/.test(t)) return 70;
-                        if (/AMISTOSO|FRIENDLY|RESERVA|SUB-?19|SUB-?20|FEMENINO|TERCERA|SEGUNDA B|REGIONAL/.test(t)) return 10;
-                        return 35;
-                    };
-
-                    const getLeagueText = (container) => {
-                        let parent = container.parentElement;
-                        let tries = 0;
-                        while (parent && tries < 6) {
-                            const header = parent.querySelector('.event__header, .sportName');
-                            if (header && header.innerText.trim().length > 3) return header.innerText.trim();
-                            // Buscar hermano previo
-                            let prev = container.previousElementSibling;
-                            let pt = 0;
-                            while (prev && pt < 4) {
-                                if (prev.matches && prev.matches('.event__header, .sportName')) return prev.innerText.trim();
-                                prev = prev.previousElementSibling; pt++;
-                            }
-                            parent = parent.parentElement;
-                            tries++;
-                        }
-                        return '';
-                    };
-
-                    // Capturar TODOS: en vivo + programados de la jornada
-                    const containers = Array.from(document.querySelectorAll('.event__match, .event__game, [id^="g_1"] div.event__match, li.event__match'));
-                    const anchorsFallback = Array.from(document.querySelectorAll('a[href*="/partido/"], a[href*="/match/"]'));
-
-                    const processContainer = (container, hrefOverride) => {
-                        let href = hrefOverride || null;
-                        if (!href) {
-                            const a = container.querySelector('a[href*="/partido/"], a[href*="/match/"], a');
-                            href = a ? a.href : null;
-                        }
-                        if (!href || seen.has(href)) return;
-                        if (!href.includes('/partido/') && !href.includes('/match/')) return;
-                        seen.add(href);
-
-                        const timeEl = container.querySelector('.event__time, .event__stage, [class*="event__time"]');
-                        const scoreEl = container.querySelector('.event__score, .event__scores, [class*="event__score"]');
-                        const participantEls = container.querySelectorAll('.event__participant, .event__participant--home, .event__participant--away, [class*="participant"]');
-
-                        let timeText = timeEl ? timeEl.innerText.trim() : '';
-                        let scoreText = scoreEl ? scoreEl.innerText.trim().replace(/\\s+/g,' ') : '';
-
-                        let containerText = container.innerText.replace(/\\s+/g,' ').trim();
-                        if (!timeText) {
-                            let m = containerText.match(/\\b\\d{1,3}(?:\\+\\d+)?'?\\b/);
-                            if (m) timeText = m[0];
-                        }
-                        if (!scoreText) {
-                            let sm = containerText.match(/\\b\\d+\\s*[-:]\\s*\\d+\\b/);
-                            if (sm) scoreText = sm[0];
-                        }
-
-                        let minute = null;
-                        let time = null;
-                        if (/^\\d{1,3}(\\+\\d+)?'?$/.test(timeText.trim())) {
-                            minute = timeText.trim();
-                            if (!minute.includes("'")) minute = minute + "'";
-                        } else if (/^\\d{1,2}:\\d{2}$/.test(timeText.trim())) {
-                            time = timeText.trim();
-                        } else {
-                            let minuteMatch = containerText.match(/(\\d{1,3}(?:\\+\\d+)?')/);
-                            if (minuteMatch) minute = minuteMatch[1];
-                            else {
-                                let minuteNoApos = containerText.match(/\\b(\\d{1,3}(?:\\+\\d+)?)\\b/);
-                                if (minuteNoApos && parseInt(minuteNoApos[1]) <= 130 && !containerText.includes(':')) {
-                                    if (scoreText) minute = minuteNoApos[1] + "'";
-                                }
-                            }
-                            let timeMatch = containerText.match(/\\b(\\d{1,2}:\\d{2})\\b/);
-                            if (timeMatch) time = timeMatch[1];
-                        }
-
-                        let score = null;
-                        if (scoreText) {
-                            let s = scoreText.match(/(\\d+)\\s*[-:]\\s*(\\d+)/);
-                            if (s) score = `${s[1]}-${s[2]}`;
-                        }
-                        if (!score) {
-                            let sm = containerText.match(/(\\d+)\\s*[-:]\\s*(\\d+)/);
-                            if (sm) score = `${sm[1]}-${sm[2]}`;
-                        }
-
-                        let teams = '';
-                        if (participantEls.length >= 2) {
-                            teams = Array.from(participantEls).slice(0,2).map(e=>e.innerText.trim()).filter(Boolean).join(' vs ');
-                        }
-                        if (!teams || teams.length < 3) {
-                            const a = container.querySelector('a[href*="/partido/"]');
-                            teams = a ? (a.innerText.trim() || a.textContent.trim()) : '';
-                        }
-                        if (!teams || teams.length < 3) {
-                            teams = containerText.replace(minute||'','').replace(score||'','').replace(time||'','').replace(/EN VIVO|LIVE/gi,'').trim().substring(0,40);
-                            if (!teams) teams = href.split('/').filter(Boolean).pop() || 'Partido';
-                        }
-                        teams = teams.replace(/\\s+/g,' ').trim();
-                        if (teams.length > 32) teams = teams.substring(0,32) + '…';
-                        if (teams.length < 3) return;
-
-                        let isLive = !!minute || /en vivo|live|en juego/i.test(containerText) || !!scoreEl;
-                        if (score && minute) isLive = true;
-                        if (!isLive && (score || minute)) isLive = true;
-
-                        // Lógica de VALOR/RELEVANCIA: prioriza Ligas Pro / Primera A, clásicos y alta expectativa de goles
-                        let leagueText = getLeagueText(container);
-                        let leagueScore = getLeagueScore(leagueText + ' ' + containerText + ' ' + teams + ' ' + href);
-                        if (/NACIONAL|MILLONARIOS|AMERICA.*CALI|JUNIOR|SANT A FE|MEDELLIN|BOCA|RIVER|FLAMENGO|PALMEIRAS|CLASICO|DERBY/.test(teams.toUpperCase())) leagueScore += 8;
-
-                        let display = '';
-                        if (isLive && minute && score) {
-                            display = `${minute} [${score}] ${teams}`;
-                        } else if (isLive && score) {
-                            display = `EN VIVO [${score}] ${teams}`;
-                        } else if (isLive && minute) {
-                            display = `${minute} ${teams}`;
-                        } else if (time) {
-                            display = `${time} - ${teams}`;
-                        } else {
-                            display = teams;
-                        }
-
-                        let sortKey = 9999;
-                        if (isLive) {
-                            let m = parseInt(minute) || 0;
-                            sortKey = -1000 + (100 - m);
-                        } else if (time) {
-                            let [h, mi] = time.split(':').map(Number);
-                            sortKey = h*60 + mi;
-                        }
-                        let attractive = (isLive && score && score !== '0-0') ? 1 : 0;
-                        raw.push({href, text: display, isLive, time, score, minute, sortKey, attractive, leagueScore, leagueText});
-                    };
-
-                    // Capturar TODOS los partidos del día (en vivo + programados) para filtrar por valor
-                    for (const c of containers) {
-                        processContainer(c);
-                        if (raw.length >= 30) break;
-                    }
-                    if (raw.length < 6) {
-                        for (const a of anchorsFallback) {
-                            processContainer(a.closest('.event__match') || a.parentElement?.parentElement || a, a.href);
-                            if (raw.length >= 30) break;
-                        }
-                    }
-
-                    // Orden inteligente: en vivo primero (con minuto/marcador), luego por VALOR de liga, atractivo y hora
-                    raw.sort((a,b) => {
-                        if (a.isLive && !b.isLive) return -1;
-                        if (!a.isLive && b.isLive) return 1;
-                        if (a.leagueScore !== b.leagueScore) return b.leagueScore - a.leagueScore;
-                        if (a.attractive !== b.attractive) return b.attractive - a.attractive;
-                        return a.sortKey - b.sortKey;
-                    });
-                    // Seleccionar los 10-12 más atractivos (prioriza Ligas Pro / Primera A y clásicos)
-                    let result = raw.slice(0,12).map(({href,text,isLive})=>({href,text,isLive}));
-                    if (result.length === 0) {
-                        // Último fallback: cualquier a en g_1
-                        const fallback = Array.from(document.querySelectorAll('[id^="g_1"] a[href]')).slice(0,8).map(a=>({href:a.href, text: (a.innerText.trim().substring(0,35) || 'Partido'), isLive:false})).filter(x=>x.href.includes('/partido/')||x.href.includes('/match/'));
-                        if (fallback.length) return fallback;
-                        // Si aún vacío, no retornar vacío: extrae texto plano de .event__match
-                        const plain = Array.from(document.querySelectorAll('.event__match')).slice(0,6).map((c,i)=>{
-                            const a = c.querySelector('a');
-                            return a ? {href: a.href, text: c.innerText.trim().substring(0,35), isLive:true} : null;
-                        }).filter(Boolean);
-                        return plain;
-                    }
-                    return result;
-                }""")
+                resp = req_requests.get(u, headers=headers, timeout=15000)
+                if resp.status_code == 200:
+                    return resp.text
+            except Exception:
+                pass
+            return ""
+        html = await asyncio.to_thread(_fetch_hoy, "https://www.flashscore.co/")
+        if not html or len(html) < 1000:
+            html_m = await asyncio.to_thread(_fetch_hoy, "https://m.flashscore.co/")
+            if html_m and len(html_m) > len(html):
+                html = html_m
+        raw = []
+        seen = set()
+        if HAS_BS4 and html:
+            try:
+                from bs4 import BeautifulSoup as BS
+                soup = BS(html, "html.parser")
+                containers = soup.select(".event__match, .event__game, [id^=\"g_1\"] div.event__match, li.event__match")
+                anchors_fallback = soup.select('a[href*="/partido/"], a[href*="/match/"]')
+                if not containers:
+                    containers = []
+                def _parse_container(container, href_override=None):
+                    href = href_override
+                    if not href:
+                        a = container.select_one('a[href*="/partido/"], a[href*="/match/"], a')
+                        href = a.get("href") if a else None
+                        if href and href.startswith("/"):
+                            href = "https://www.flashscore.co" + href
+                    if not href or href in seen:
+                        return None
+                    if "/partido/" not in href and "/match/" not in href:
+                        return None
+                    seen.add(href)
+                    txt = container.get_text(separator=" ", strip=True)
+                    import re as re_inner
+                    minute = None
+                    score = None
+                    time = None
+                    m = re_inner.search(r"\b\d{1,3}(?:\+\d+)?'\b", txt)
+                    if m:
+                        minute = m.group(0)
+                    s = re_inner.search(r"\b\d+\s*[-:]\s*\d+\b", txt)
+                    if s:
+                        score = s.group(0).replace(" ", "").replace(":", "-")
+                    t = re_inner.search(r"\b\d{1,2}:\d{2}\b", txt)
+                    if t and not minute:
+                        time = t.group(0)
+                    parts = container.select(".event__participant")
+                    teams = ""
+                    if len(parts) >= 2:
+                        teams = " vs ".join([pp.get_text(strip=True) for pp in parts[:2]])
+                    if not teams or len(teams) < 3:
+                        a = container.select_one('a[href*="/partido/"]')
+                        if a:
+                            teams = a.get_text(strip=True)
+                    if not teams or len(teams) < 3:
+                        teams = txt.replace(minute or "", "").replace(score or "", "").replace(time or "", "").strip()[:40]
+                    teams = " ".join(teams.split())
+                    if len(teams) > 32:
+                        teams = teams[:32] + "…"
+                    if len(teams) < 3:
+                        return None
+                    is_live = bool(minute or score and "en vivo" in txt.lower())
+                    if score and minute:
+                        is_live = True
+                    league_text = ""
+                    parent = container.parent
+                    tries = 0
+                    while parent and tries < 5:
+                        hdr = parent.select_one(".event__header, .sportName")
+                        if hdr and hdr.get_text(strip=True):
+                            league_text = hdr.get_text(strip=True)
+                            break
+                        parent = parent.parent
+                        tries += 1
+                    def get_league_score(t):
+                        tu = (t or "").upper()
+                        if any(k in tu for k in ["PRIMERA A", "BETPLAY", "DIMAYOR"]):
+                            return 100
+                        if any(k in tu for k in ["PREMIER LEAGUE", "LA LIGA", "SERIE A", "BUNDESLIGA", "CHAMPIONS", "LIBERTADORES"]):
+                            return 95
+                        if "AMISTOSO" in tu or "FRIENDLY" in tu:
+                            return 10
+                        return 35
+                    league_score = get_league_score(league_text + " " + txt + " " + teams)
+                    if is_live and minute and score:
+                        display = f"{minute} [{score}] {teams}"
+                    elif is_live and score:
+                        display = f"EN VIVO [{score}] {teams}"
+                    elif is_live and minute:
+                        display = f"{minute} {teams}"
+                    elif time:
+                        display = f"{time} - {teams}"
+                    else:
+                        display = teams
+                    sort_key = 9999
+                    if is_live:
+                        try:
+                            m2 = int(re_inner.search(r"\d+", minute or "0").group(0))
+                        except:
+                            m2 = 0
+                        sort_key = -1000 + (100 - m2)
+                    elif time:
+                        try:
+                            h, mi = map(int, time.split(":"))
+                            sort_key = h*60+mi
+                        except:
+                            sort_key = 9999
+                    attractive = 1 if (is_live and score and score != "0-0") else 0
+                    return {"href": href, "text": display, "isLive": is_live, "sortKey": sort_key, "attractive": attractive, "leagueScore": league_score}
+                for c in containers:
+                    if len(raw) >= 30:
+                        break
+                    r = _parse_container(c)
+                    if r:
+                        raw.append(r)
+                if len(raw) < 6:
+                    for a in anchors_fallback:
+                        href = a.get("href")
+                        if href and href.startswith("/"):
+                            href = "https://www.flashscore.co" + href
+                        if not href or href in seen:
+                            continue
+                        cont = a.find_parent(class_=lambda x: x and "event__match" in x) or a.parent
+                        r = _parse_container(cont, href)
+                        if r:
+                            raw.append(r)
+                        if len(raw) >= 30:
+                            break
+                raw.sort(key=lambda x: (not x["isLive"], -x["leagueScore"], -x["attractive"], x["sortKey"]))
+                partidos = [{"href": r["href"], "text": r["text"], "isLive": r["isLive"]} for r in raw[:12]]
+                if not partidos:
+                    partidos = []
             except Exception as e:
+                logging.exception(f"Error HTTP /hoy: {e}")
                 partidos = []
-            await browser.close()
     except Exception as e:
-        logging.exception(f"Error Playwright /hoy: {e}")
+        logging.exception(f"Error HTTP /hoy: {e}")
         await status_msg.edit_text("❌ Error al conectar con Flashscore en vivo. Intenta de nuevo en unos segundos, mi hermano.")
         return
     if not partidos:
@@ -1176,82 +1182,24 @@ async def handle_user_flow(message: Message, state: FSMContext):
         if url.startswith("http"):
             await message.answer("⚠️ Por favor envía un enlace válido de Flashscore (debe contener 'flashscore').\nSi quieres evaluar una cuota escríbela así: `1.90 al ambos anotan`\n🎯 Para parlays usa /combinada", reply_markup=kb_proactivo())
         return
-    status_msg = await message.answer("🔍 Enlace válido, parcero. Iniciando extracción con Playwright (headless)... pilas pues, esto toma unos segundos.")
-    scraped_text = ""
+    status_msg = await message.answer("🔍 Enlace válido, parcero. Extrayendo vía HTTP ligero (sin navegador)...", reply_markup=kb_proactivo())
     try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled", "--disable-features=IsolateOrigins,site-per-process", "--disable-site-isolation-trials", "--window-size=1920,1080"])
-            context = await browser.new_context(viewport={"width": 1280, "height": 800}, locale="es-CO", extra_http_headers={"Accept-Language": "es-ES,es;q=0.9"}, java_script_enabled=True, ignore_https_errors=True)
-            page = await context.new_page()
-            await stealth_async(page)
-            await asyncio.sleep(random.uniform(1.0, 3.0))
-            await page.goto(url, timeout=30000, wait_until="domcontentloaded")
-            await page.mouse.move(100, 100)
-            await asyncio.sleep(random.uniform(2.0, 4.5))
-            # 1) Esperar contenedor específico #detail (vivo y pre-partido) - NO body
-            try:
-                await page.wait_for_selector('#detail, .container__detail', timeout=30000)
-            except Exception as e:
-                logging.warning(f"Flashscore bloqueó lectura (timeout #detail): {e}")
-                try:
-                    await browser.close()
-                except Exception:
-                    pass
-                await status_msg.edit_text("❌ Flashscore bloqueó la lectura del partido, intenta de nuevo")
-                return
-            # 2) Extraer SOLO datos reales del contenedor
-            try:
-                try:
-                    body_text = await page.inner_text('#detail')
-                except Exception:
-                    body_text = await page.inner_text('.container__detail')
-            except Exception as e:
-                logging.warning(f"Flashscore bloqueó lectura (inner_text #detail): {e}")
-                try:
-                    await browser.close()
-                except Exception:
-                    pass
-                await status_msg.edit_text("❌ Flashscore bloqueó la lectura del partido, intenta de nuevo")
-                return
-            scraped_text = body_text[:3000]
-            _low = scraped_text.lower()
-            _has_stats = any(k in _low for k in ["h2h", "historial", "alineación", "alineacion", "árbitro", "arbitro", "estadística", "estadistica", "head to head", "corners", "córners", "posesión", "posesion", "tarjetas", "goles", "formation", "lineup"])
-            if len(scraped_text.strip()) < 150 or not _has_stats:
-                try:
-                    await browser.close()
-                except Exception:
-                    pass
-                await status_msg.edit_text("❌ Flashscore bloqueó la lectura del partido, intenta de nuevo")
-                return
-            # === EXTRACCIÓN OBLIGATORIA MINUTO Y MARCADOR EN VIVO ===
-            try:
-                live_info = await page.evaluate("""() => {
-                    const timeEl = document.querySelector('.event__time, .event__stage, .detailScore__time, [class*="event__time"], [class*="detailTime"]');
-                    const scoreEl = document.querySelector('.event__score, .detailScore__wrapper, .detailScore, [class*="event__score"], [class*="score"]');
-                    let minute = timeEl ? timeEl.innerText.trim() : '';
-                    let score = scoreEl ? scoreEl.innerText.trim().replace(/\\s+/g,' ') : '';
-                    if (!minute || !score) {
-                        const txt = document.body.innerText;
-                        const m = txt.match(/\\b\\d{1,3}(?:\\+\\d+)?'\\b/);
-                        if (m && !minute) minute = m[0];
-                        const s = txt.match(/\\b\\d+\\s*[-:]\\s*\\d+\\b/);
-                        if (s && !score) score = s[0].replace(/\\s+/g,'').replace(':','-');
-                    }
-                    return {minute: minute || '', score: score || ''};
-                }""")
-                minute_live = live_info.get('minute', '').strip() if isinstance(live_info, dict) else ''
-                score_live = live_info.get('score', '').strip() if isinstance(live_info, dict) else ''
-            except Exception:
-                minute_live = ''
-                score_live = ''
-            live_header = f"MINUTO ACTUAL: {minute_live if minute_live else 'No iniciado / Sin dato'} | MARCADOR EN VIVO: {score_live if score_live else ('0-0 (programado)' if not minute_live else 'No detectado')}"
-            await browser.close()
+        scraped_text, minute_live, score_live = await fetch_flashscore_text(url)
+        if not scraped_text or len(scraped_text.strip()) < 150:
+            await status_msg.edit_text("❌ Flashscore bloqueó la lectura del partido, intenta de nuevo")
+            return
+        _low = scraped_text.lower()
+        _has_stats = any(k in _low for k in ["h2h", "historial", "alineación", "alineacion", "árbitro", "arbitro", "estadística", "estadistica", "head to head", "corners", "córners", "posesión", "posesion", "tarjetas", "goles", "formation", "lineup"])
+        if len(scraped_text.strip()) < 150 or not _has_stats:
+            await status_msg.edit_text("❌ Flashscore bloqueó la lectura del partido, intenta de nuevo")
+            return
+        live_header = f"MINUTO ACTUAL: {minute_live if minute_live else 'No iniciado / Sin dato'} | MARCADOR EN VIVO: {score_live if score_live else ('0-0 (programado)' if not minute_live else 'No detectado')}"
     except Exception as e:
-        logging.exception(f"Error Playwright: {e}")
-        await status_msg.edit_text("❌ Error al extraer datos de Flashscore. Verifica el enlace o intenta más tarde, mi hermano.")
+        logging.exception(f"Error HTTP ligero: {e}")
+        await status_msg.edit_text("❌ Error al extraer datos del partido. Intenta de nuevo, parcero.")
         return
     if not scraped_text.strip():
-        await status_msg.edit_text("❌ No se pudo extraer contenido. El sitio puede estar bloqueando el scraping.")
+        await status_msg.edit_text("❌ No se pudo extraer contenido. El sitio puede estar bloqueando.")
         return
     await state.update_data(scraped_text=f"{live_header}\n{scraped_text}", last_url=url, minute_live=minute_live, score_live=score_live)
     await status_msg.edit_text(f"📊 Estadísticas leídas. {live_header}. Analizando con lupa alineaciones y bajas...")
