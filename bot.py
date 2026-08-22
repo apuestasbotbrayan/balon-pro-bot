@@ -563,56 +563,110 @@ async def cmd_hoy(message: Message, state: FSMContext):
             await page.goto("https://www.flashscore.co/en-vivo/", timeout=60000, wait_until="commit")
             await asyncio.sleep(random.uniform(3.0, 5.0))
             try:
-                await page.wait_for_selector("body", timeout=10000)
+                await page.wait_for_selector('.event__match, [id^="g_1"], .sportName', timeout=10000)
             except Exception:
-                pass
-            # Extraer enlaces distinguiendo EN VIVO vs PROGRAMADO
+                try:
+                    await page.wait_for_selector("body", timeout=5000)
+                except Exception:
+                    pass
+            # Extraer enlaces distinguiendo EN VIVO vs PROGRAMADO - SELECTORES PRECISOS EN DIRECTO
             try:
                 partidos = await page.evaluate("""() => {
-                    const anchors = Array.from(document.querySelectorAll('a[href*="/partido/"], a[href*="/match/"]'));
                     const seen = new Set();
                     const raw = [];
-                    for (const a of anchors) {
-                        let href = a.href;
-                        if (!href || seen.has(href)) continue;
-                        if (!href.includes('/partido/') && !href.includes('/match/')) continue;
+
+                    // 1) Prioridad: contenedores oficiales de partidos en vivo
+                    const containers = Array.from(document.querySelectorAll('.event__match, .event__game, [id^="g_1"] div.event__match, li.event__match'));
+                    const anchorsFallback = Array.from(document.querySelectorAll('a[href*="/partido/"], a[href*="/match/"]'));
+
+                    const processContainer = (container, hrefOverride) => {
+                        let href = hrefOverride || null;
+                        if (!href) {
+                            const a = container.querySelector('a[href*="/partido/"], a[href*="/match/"], a');
+                            href = a ? a.href : null;
+                        }
+                        if (!href || seen.has(href)) return;
+                        if (!href.includes('/partido/') && !href.includes('/match/')) return;
                         seen.add(href);
-                        // Contenedor más cercano con info de tiempo/marcador
-                        let container = a.closest('[id^="g_1"], .event__match, .event__game, li, article, .sportName');
-                        if (!container) container = a.parentElement?.parentElement || a.parentElement || a;
-                        let containerText = container ? container.innerText : a.innerText;
-                        containerText = containerText.replace(/\\s+/g, ' ').trim();
 
-                        // Minuto en vivo: 62' , 45+2'
-                        let minuteMatch = containerText.match(/(\\d{1,3}(?:\\+\\d+)?')/);
-                        let minute = minuteMatch ? minuteMatch[1] : null;
+                        // Selectores precisos Flashscore
+                        const timeEl = container.querySelector('.event__time, .event__stage, [class*="event__time"]');
+                        const scoreEl = container.querySelector('.event__score, .event__scores, [class*="event__score"]');
+                        const participantEls = container.querySelectorAll('.event__participant, .event__participant--home, .event__participant--away, [class*="participant"]');
 
-                        // Marcador: 0 - 3 , 2:1
-                        let scoreMatch = containerText.match(/(\\d+\\s*[-:]\\s*\\d+)/);
-                        let score = scoreMatch ? scoreMatch[1].replace(/\\s+/g,'').replace(':','-') : null;
+                        let timeText = timeEl ? timeEl.innerText.trim() : '';
+                        let scoreText = scoreEl ? scoreEl.innerText.trim().replace(/\\s+/g,' ') : '';
 
-                        // Hora programada: 15:00
-                        let timeMatch = containerText.match(/\\b(\\d{1,2}:\\d{2})\\b/);
-                        let time = timeMatch ? timeMatch[1] : null;
+                        // Fallback: si no hay timeEl/scoreEl, usar texto del contenedor
+                        let containerText = container.innerText.replace(/\\s+/g,' ').trim();
+                        if (!timeText) {
+                            let m = containerText.match(/\\b\\d{1,3}(?:\\+\\d+)?'?\\b/);
+                            if (m) timeText = m[0];
+                        }
+                        if (!scoreText) {
+                            let sm = containerText.match(/\\b\\d+\\s*[-:]\\s*\\d+\\b/);
+                            if (sm) scoreText = sm[0];
+                        }
 
-                        // Equipos
-                        let teams = a.innerText.trim() || a.textContent.trim();
-                        if (!teams || teams.length < 3) {
-                            const parts = container ? Array.from(container.querySelectorAll('.event__participant, .participant, [class*="participant"]')).map(e=>e.innerText.trim()).filter(Boolean) : [];
-                            if (parts.length >= 2) teams = parts.slice(0,2).join(' vs ');
+                        // Minuto: 90+6, 86, 30, 45+2'  (con o sin apóstrofe)
+                        let minute = null;
+                        let time = null;
+                        if (/^\\d{1,3}(\\+\\d+)?'?$/.test(timeText.trim())) {
+                            minute = timeText.trim();
+                            // Normalizar sin apóstrofe -> agregar '
+                            if (!minute.includes("'")) minute = minute + "'";
+                        } else if (/^\\d{1,2}:\\d{2}$/.test(timeText.trim())) {
+                            time = timeText.trim();
+                        } else {
+                            // Detectar dentro de containerText
+                            let minuteMatch = containerText.match(/(\\d{1,3}(?:\\+\\d+)?')/);
+                            if (minuteMatch) minute = minuteMatch[1];
                             else {
-                                teams = containerText.replace(minute||'','').replace(score||'','').replace(time||'','').replace(/EN VIVO|LIVE/i,'').trim().substring(0,40);
-                                if (!teams) teams = href.split('/').filter(Boolean).pop() || 'Partido';
+                                let minuteNoApos = containerText.match(/\\b(\\d{1,3}(?:\\+\\d+)?)\\b/);
+                                // Evitar confundir con score/hora - solo si parece minuto vivo
+                                if (minuteNoApos && parseInt(minuteNoApos[1]) <= 130 && !containerText.includes(':')) {
+                                    // validación extra: si hay marcador cerca, es minuto
+                                    if (scoreText) minute = minuteNoApos[1] + "'";
+                                }
                             }
+                            let timeMatch = containerText.match(/\\b(\\d{1,2}:\\d{2})\\b/);
+                            if (timeMatch) time = timeMatch[1];
+                        }
+
+                        // Goles actuales: normalizar a X-Y
+                        let score = null;
+                        if (scoreText) {
+                            let s = scoreText.match(/(\\d+)\\s*[-:]\\s*(\\d+)/);
+                            if (s) score = `${s[1]}-${s[2]}`;
+                        }
+                        if (!score) {
+                            let sm = containerText.match(/(\\d+)\\s*[-:]\\s*(\\d+)/);
+                            if (sm) score = `${sm[1]}-${sm[2]}`;
+                        }
+
+                        // Equipos: preciso desde .event__participant
+                        let teams = '';
+                        if (participantEls.length >= 2) {
+                            teams = Array.from(participantEls).slice(0,2).map(e=>e.innerText.trim()).filter(Boolean).join(' vs ');
+                        }
+                        if (!teams || teams.length < 3) {
+                            const a = container.querySelector('a[href*="/partido/"]');
+                            teams = a ? (a.innerText.trim() || a.textContent.trim()) : '';
+                        }
+                        if (!teams || teams.length < 3) {
+                            teams = containerText.replace(minute||'','').replace(score||'','').replace(time||'','').replace(/EN VIVO|LIVE/gi,'').trim().substring(0,40);
+                            if (!teams) teams = href.split('/').filter(Boolean).pop() || 'Partido';
                         }
                         teams = teams.replace(/\\s+/g,' ').trim();
                         if (teams.length > 32) teams = teams.substring(0,32) + '…';
-                        if (teams.length < 3) continue;
+                        if (teams.length < 3) return;
 
-                        let isLive = !!minute || /en vivo|live|en juego/i.test(containerText);
+                        let isLive = !!minute || /en vivo|live|en juego/i.test(containerText) || !!scoreEl;
                         if (score && minute) isLive = true;
+                        // En la pestaña EN DIRECTO, todo lo listado es vivo por defecto si tiene minuto/score
+                        if (!isLive && (score || minute)) isLive = true;
 
-                        let display = "";
+                        let display = '';
                         if (isLive && minute && score) {
                             display = `${minute} [${score}] ${teams}`;
                         } else if (isLive && score) {
@@ -625,24 +679,31 @@ async def cmd_hoy(message: Message, state: FSMContext):
                             display = teams;
                         }
 
-                        // Clave de orden: en vivo primero, luego por hora asc
                         let sortKey = 9999;
                         if (isLive) {
                             let m = parseInt(minute) || 0;
-                            sortKey = -1000 + (100 - m); // minuto alto primero
+                            sortKey = -1000 + (100 - m);
                         } else if (time) {
-                            let [h,mi] = time.split(':').map(Number);
+                            let [h, mi] = time.split(':').map(Number);
                             sortKey = h*60 + mi;
                         }
-
-                        // Prioridad atractivo: con goles > sin goles
-                        let attractive = 0;
-                        if (isLive && score && score !== '0-0') attractive = 1;
-
+                        let attractive = (isLive && score && score !== '0-0') ? 1 : 0;
                         raw.push({href, text: display, isLive, time, score, minute, sortKey, attractive});
+                    };
+
+                    // Procesar contenedores oficiales primero
+                    for (const c of containers) {
+                        processContainer(c);
                         if (raw.length >= 18) break;
                     }
-                    // Ordenar: en vivo primero, atractivos primero, luego cronológico
+                    // Fallback: anchors si no se llenó
+                    if (raw.length < 4) {
+                        for (const a of anchorsFallback) {
+                            processContainer(a.closest('.event__match') || a.parentElement?.parentElement || a, a.href);
+                            if (raw.length >= 18) break;
+                        }
+                    }
+
                     raw.sort((a,b) => {
                         if (a.isLive && !b.isLive) return -1;
                         if (!a.isLive && b.isLive) return 1;
@@ -650,14 +711,19 @@ async def cmd_hoy(message: Message, state: FSMContext):
                             if (a.attractive !== b.attractive) return b.attractive - a.attractive;
                             return a.sortKey - b.sortKey;
                         }
-                        // ambos programados
                         return a.sortKey - b.sortKey;
                     });
-                    const result = raw.slice(0,12).map(({href,text,isLive})=>({href,text,isLive}));
-                    // Fallback si no hay nada
-                    if (result.length === 0 && raw.length === 0) {
-                        const fallback = Array.from(document.querySelectorAll('[id^="g_1"] a')).slice(0,8).map(a=>({href:a.href, text: a.innerText.trim().substring(0,35) || 'Partido', isLive:false})).filter(x=>x.href);
-                        return fallback;
+                    let result = raw.slice(0,12).map(({href,text,isLive})=>({href,text,isLive}));
+                    if (result.length === 0) {
+                        // Último fallback: cualquier a en g_1
+                        const fallback = Array.from(document.querySelectorAll('[id^="g_1"] a[href]')).slice(0,8).map(a=>({href:a.href, text: (a.innerText.trim().substring(0,35) || 'Partido'), isLive:false})).filter(x=>x.href.includes('/partido/')||x.href.includes('/match/'));
+                        if (fallback.length) return fallback;
+                        // Si aún vacío, no retornar vacío: extrae texto plano de .event__match
+                        const plain = Array.from(document.querySelectorAll('.event__match')).slice(0,6).map((c,i)=>{
+                            const a = c.querySelector('a');
+                            return a ? {href: a.href, text: c.innerText.trim().substring(0,35), isLive:true} : null;
+                        }).filter(Boolean);
+                        return plain;
                     }
                     return result;
                 }""")
