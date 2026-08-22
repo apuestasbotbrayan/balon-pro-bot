@@ -133,6 +133,174 @@ async def fetch_flashscore_text(url: str) -> tuple[str, str, str]:
     except Exception:
         return "", "", ""
 
+async def fetch_fotmob_data(url: str) -> tuple[str, str, str]:
+    """Extrae matchId de URL FotMob y consume https://www.fotmob.com/api/matchDetails?matchId=... via curl_cffi."""
+    def _extract_match_id(u: str) -> str:
+        m = re.search(r"matchId=([a-zA-Z0-9]+)", u)
+        if m:
+            return m.group(1)
+        m = re.search(r"/matches/[^/]+/[^/]+/([a-zA-Z0-9]+)", u)
+        if m:
+            return m.group(1)
+        m = re.search(r"/match/([a-zA-Z0-9]+)", u)
+        if m:
+            return m.group(1)
+        # Fallback: último segmento alfanumérico >=5
+        parts = u.rstrip("/").split("/")
+        for part in reversed(parts):
+            part = part.split("#")[0].split("?")[0]
+            if re.match(r"^[a-zA-Z0-9]{5,}$", part) and part.lower() not in ["matches", "match", "fotmob"]:
+                return part
+        return ""
+
+    def _fetch_api(mid: str) -> dict:
+        api_url = f"https://www.fotmob.com/api/matchDetails?matchId={mid}"
+        headers = dict(HEADERS_CHROME)
+        headers["Referer"] = "https://www.fotmob.com/"
+        headers["Accept"] = "application/json, text/plain, */*"
+        headers["X-Requested-With"] = "XMLHttpRequest"
+        if HAS_CURL and curl_requests is not None:
+            try:
+                resp = curl_requests.get(api_url, headers=headers, impersonate="chrome110", timeout=15000)
+                if resp.status_code == 200:
+                    try:
+                        return resp.json()
+                    except Exception:
+                        try:
+                            return json.loads(resp.text)
+                        except Exception:
+                            return {}
+            except Exception:
+                pass
+        try:
+            resp = req_requests.get(api_url, headers=headers, timeout=15000)
+            if resp.status_code == 200:
+                return resp.json()
+        except Exception:
+            pass
+        return {}
+
+    def _format(data: dict) -> tuple[str, str, str]:
+        try:
+            # Equipos y liga
+            general = data.get("general") or {}
+            header = data.get("header") or {}
+            content = data.get("content") or {}
+            # Nombres
+            home = general.get("homeTeam") or header.get("homeTeam") or data.get("homeTeam") or {}
+            away = general.get("awayTeam") or header.get("awayTeam") or data.get("awayTeam") or {}
+            if not home.get("name"):
+                # Probar header.teams
+                teams_hdr = header.get("teams") or []
+                if isinstance(teams_hdr, list) and len(teams_hdr) >= 2:
+                    home = teams_hdr[0]
+                    away = teams_hdr[1]
+            home_name = home.get("name") or home.get("shortName") or home.get("teamName") or ""
+            away_name = away.get("name") or away.get("shortName") or away.get("teamName") or ""
+            teams_txt = f"{home_name} vs {away_name}" if home_name and away_name else ""
+            league = general.get("leagueName") or general.get("parentLeagueName") or header.get("leagueName") or data.get("leagueName") or ""
+            if not league:
+                league = content.get("matchFacts", {}).get("leagueName") or ""
+            # Minuto y marcador - múltiples rutas FotMob
+            minute = ""
+            score = ""
+            # Header status
+            status = header.get("status") or general.get("status") or {}
+            if isinstance(status, dict):
+                live = status.get("liveTime") or status.get("time") or header.get("liveTime") or general.get("liveTime") or ""
+                if isinstance(live, dict):
+                    minute = live.get("short") or live.get("long") or ""
+                elif live:
+                    minute = str(live)
+                # Score desde header.teams
+                teams_data = header.get("teams") or []
+                if isinstance(teams_data, list) and len(teams_data) >= 2:
+                    try:
+                        hs = teams_data[0].get("score")
+                        aws = teams_data[1].get("score")
+                        if hs is not None and aws is not None:
+                            score = f"{hs}-{aws}"
+                    except Exception:
+                        pass
+            else:
+                if status:
+                    minute = str(status)
+            # Fallback: content
+            if not minute:
+                minute = content.get("liveTime") or data.get("liveTime") or general.get("matchTime") or ""
+                if isinstance(minute, dict):
+                    minute = minute.get("short") or ""
+                minute = str(minute).strip() if minute else ""
+            # Score fallback: buscar en header/general/content
+            if not score:
+                for src in [header, general, content]:
+                    for k in ["score", "result", "scores"]:
+                        v = src.get(k)
+                        if isinstance(v, str) and re.search(r"\d+[-:]\d+", v):
+                            score = v.replace(":", "-").replace(" ", "")
+                            break
+                    if score:
+                        break
+                if not score:
+                    # Buscar en texto JSON
+                    txt_dump = str(data)
+                    m = re.search(r"\b\d+\s*[-:]\s*\d+\b", txt_dump)
+                    if m:
+                        score = m.group(0).replace(" ", "").replace(":", "-")
+            # Normalizar minuto
+            minute = str(minute).strip()
+            if minute and minute.lower() not in ["en vivo", "ht", "ft", "half time", "full time", "finished", "abandoned"] and minute.isdigit():
+                minute = minute + "'"
+            if minute and "'" not in minute and re.match(r"^\d{1,3}(\+\d+)?$", minute):
+                minute = minute + "'"
+            # Construir texto limpio para Gemini
+            parts = []
+            if teams_txt:
+                parts.append(f"Partido: {teams_txt}")
+            if league:
+                parts.append(f"Liga: {league}")
+            parts.append(f"Minuto: {minute or 'No iniciado'} | Marcador: {score or '0-0'}")
+            # Estadísticas clave
+            # FotMob content.stats, liveData, matchFacts
+            for key in ["stats", "matchFacts", "lineups", "table", "h2h"]:
+                if key in content and content[key]:
+                    try:
+                        parts.append(f"{key}: {str(content[key])[:900]}")
+                    except Exception:
+                        pass
+            if "stats" in data and data["stats"]:
+                parts.append(f"stats: {str(data['stats'])[:900]}")
+            # Si queda corto, volcar JSON relevante
+            full = "\n".join([p for p in parts if p])
+            if len(full) < 400:
+                # Añadir resumen JSON
+                try:
+                    full += "\nJSON: " + json.dumps(data, ensure_ascii=False)[:2500]
+                except Exception:
+                    full += "\nJSON: " + str(data)[:2500]
+            return full[:4000], minute, score
+        except Exception as e:
+            logging.warning(f"FotMob format error: {e}")
+            return str(data)[:4000], "", ""
+
+    mid = _extract_match_id(url)
+    if not mid:
+        return "", "", ""
+    data = await asyncio.to_thread(_fetch_api, mid)
+    if not data:
+        return "", "", ""
+    return _format(data)
+
+async def fetch_match_data(url: str) -> tuple[str, str, str]:
+    """Unifica FotMob y Flashscore: detecta dominio y usa la API correspondiente."""
+    low = url.lower()
+    if "fotmob.com" in low:
+        txt, minute, score = await fetch_fotmob_data(url)
+        if txt and len(txt.strip()) > 80:
+            return txt, minute, score
+        # Fallback a flashscore si fotmob falla
+    return await fetch_match_data(url)
+
 # ==========================================
 # 1. CONFIGURACIÓN Y CREDENCIALES (con soporte para Render Env Vars)
 # ==========================================
@@ -148,7 +316,7 @@ genai.configure(api_key=GEMINI_API_KEY)
 
 # === PROMPT PROACTIVO CORREGIDO - SIN INVENTAR CUOTAS + CONCIENCIA EN VIVO ===
 SYSTEM_INSTRUCTION = (
-    "Actúa como tipster profesional colombiano parcero experto. Cuando recibas datos de Flashscore, "
+    "Actúa como tipster profesional colombiano parcero experto. Cuando recibas datos de un partido (Flashscore/FotMob), "
     "REVISA CON LUPA las alineaciones probables y bajas de jugadores clave, además de árbitro, H2H y tendencias. "
     "TE INYECTARÉ OBLIGATORIAMENTE el MINUTO ACTUAL (ej. 85', 90+2') y el MARCADOR EN VIVO (ej. 3-0) si el partido está en juego; si es programado dirá 'No iniciado'. "
     "SÉ CONSCIENTE DEL MINUTO EXACTO: si minuto >75 o marcador abultado (ej. 3-0, 4-1), PROHIBIDO sugerir mercados pre-partido obsoletos como 'Ambos Anotan' si ya van 3-0, 'Over 2.5' si ya está definido, o 'Gana X' si no queda tiempo. "
@@ -593,7 +761,7 @@ async def cmd_combinada(message: Message, state: FSMContext):
     await state.update_data(partidos_combinada=[])
     await message.answer(
         "🎯 *Modo Combinada activado, mi hermano!*\n\n"
-        "Envíame varios enlaces de Flashscore uno por uno (Partido 1, Partido 2...).\n"
+        "Envíame varios enlaces de Flashscore/FotMob uno por uno (Partido 1, Partido 2...).\n"
         "Los voy acumulando sin descontar tu límite diario.\n\n"
         "Cuando termines escribe `/calcular_combinada` o `listo` y te armo el parlay.\n"
         "💡 Tip: puedes mandar 2 a 5 partidos.",
@@ -627,7 +795,7 @@ async def ejecutar_analisis_proactivo(url: str, message: Message, state: FSMCont
     status_msg = await message.answer("🔍 Enlace seleccionado, parcero. Extrayendo vía HTTP ligero (sin navegador, evadiendo Cloudflare)...", reply_markup=kb_proactivo())
     # HTTP directo con headers Chrome real + curl_cffi (TLS fingerprint) + fallback móvil
     try:
-        scraped_text, minute_live, score_live = await fetch_flashscore_text(url)
+        scraped_text, minute_live, score_live = await fetch_match_data(url)
         # Si HTTP no trajo stats, intentar móvil ya está dentro de fetch
         if not scraped_text or len(scraped_text.strip()) < 150:
             await status_msg.edit_text("❌ Flashscore bloqueó la lectura del partido, intenta de nuevo")
@@ -650,7 +818,7 @@ async def ejecutar_analisis_proactivo(url: str, message: Message, state: FSMCont
     await status_msg.edit_text(f"📊 Estadísticas leídas. {live_header}. Analizando con lupa alineaciones y bajas...")
     try:
         model = genai.GenerativeModel(model_name="gemini-1.5-flash", system_instruction=SYSTEM_INSTRUCTION)
-        prompt = f"{live_header}\nDatos extraídos de Flashscore (H2H, alineaciones probables, bajas de jugadores clave, árbitro, tendencias) - Partido: {url}\n\n{scraped_text}\n\n{live_header} - Gemini, usa este minuto/marcador para decidir: si >75' o marcador abultado, prohíbe mercados obsoletos."
+        prompt = f"{live_header}\nDatos extraídos de Flashscore/FotMob (H2H, alineaciones probables, bajas de jugadores clave, árbitro, tendencias) - Partido: {url}\n\n{scraped_text}\n\n{live_header} - Gemini, usa este minuto/marcador para decidir: si >75' o marcador abultado, prohíbe mercados obsoletos."
         response = await asyncio.to_thread(model.generate_content, prompt)
         analysis_result = response.text.strip() if hasattr(response, "text") and response.text else str(response)
         increment_user_usage(telegram_id)
@@ -960,43 +1128,26 @@ async def procesar_combinada(message: Message, state: FSMContext):
     if not allowed:
         await message.answer(err_msg)
         return
-    status_msg = await message.answer(f"🔍 Procesando combinada de {len(partidos)} partidos... extrayendo datos (20-40s)")
+    status_msg = await message.answer(f"🔍 Procesando combinada de {len(partidos)} partidos... vía HTTP ligero (FotMob/Flashscore)")
     textos_combinados = []
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled", "--disable-features=IsolateOrigins,site-per-process", "--disable-site-isolation-trials", "--window-size=1920,1080"])
-            context = await browser.new_context(viewport={"width": 1280, "height": 800}, locale="es-CO", extra_http_headers={"Accept-Language": "es-ES,es;q=0.9"}, java_script_enabled=True, ignore_https_errors=True)
-            for idx, url in enumerate(partidos, 1):
-                try:
-                    page = await context.new_page()
-                    await stealth_async(page)
-                    await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
-                    await asyncio.sleep(random.uniform(1.0, 2.5))
-                    await page.goto(url, timeout=30000, wait_until="domcontentloaded")
-                    await page.mouse.move(100, 100)
-                    await asyncio.sleep(random.uniform(1.5, 3.0))
-                    try:
-                        await page.wait_for_selector("body", timeout=8000)
-                    except Exception:
-                        pass
-                    body_text = await page.inner_text("body")
-                    textos_combinados.append(f"--- PARTIDO {idx}: {url} ---\n{body_text[:2500]}")
-                    await page.close()
-                except Exception as e:
-                    logging.exception(f"Error scraping combinada {idx}: {e}")
-                    textos_combinados.append(f"--- PARTIDO {idx}: {url} ---\n[Error extrayendo datos]")
-            await browser.close()
-    except Exception as e:
-        logging.exception(f"Error Playwright combinada: {e}")
-        await status_msg.edit_text("❌ Error extrayendo datos de la combinada. Intenta de nuevo, mi hermano.")
-        return
+    for idx, url in enumerate(partidos, 1):
+        try:
+            txt, minute, score = await fetch_match_data(url)
+            if not txt or len(txt.strip()) < 80:
+                txt = f"[Datos limitados para {url}]"
+            header = f"MINUTO: {minute or 'No iniciado'} | MARCADOR: {score or '0-0'}"
+            textos_combinados.append(f"--- PARTIDO {idx}: {url} ---\n{header}\n{txt[:2500]}")
+            await asyncio.sleep(random.uniform(0.4, 0.9))
+        except Exception as e:
+            logging.exception(f"Error HTTP combinada {idx}: {e}")
+            textos_combinados.append(f"--- PARTIDO {idx}: {url} ---\n[Error HTTP]")
     if not textos_combinados:
         await status_msg.edit_text("❌ No se pudo extraer datos.")
         return
     await status_msg.edit_text("📊 Datos leídos. Calculando viabilidad conjunta del parlay...")
     try:
         model = genai.GenerativeModel(model_name="gemini-1.5-flash", system_instruction=SYSTEM_INSTRUCTION_COMBINADA)
-        prompt = f"Datos combinados para Combinada/Parlay de {len(partidos)} partidos:\n\n" + "\n\n".join(textos_combinados)
+        prompt = f"Datos combinados para Combinada/Parlay (Flashscore/FotMob) de {len(partidos)} partidos:\n\n" + "\n\n".join(textos_combinados)
         prompt += "\n\nRecuerda: revisa alineaciones y bajas, no inventes cuotas, 1 línea por selección, indica casa y viabilidad conjunta."
         response = await asyncio.to_thread(model.generate_content, prompt)
         result = response.text.strip() if hasattr(response, "text") and response.text else str(response)
@@ -1044,7 +1195,7 @@ async def cb_modo_combinada(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AnalysisStates.collecting_combinada)
     await state.update_data(partidos_combinada=[])
     await callback.message.answer(
-        "🎯 *Modo Combinada activado!*\nEnvíame enlaces de Flashscore uno por uno.\nCuando termines pulsa 🔥 Calcular Parlay.",
+        "🎯 *Modo Combinada activado!*\nEnvíame enlaces de Flashscore/FotMob uno por uno.\nCuando termines pulsa 🔥 Calcular Parlay.",
         parse_mode="Markdown",
         reply_markup=kb_combinada()
     )
@@ -1136,7 +1287,7 @@ async def handle_user_flow(message: Message, state: FSMContext):
         if text_lower in ("listo", "listo!", "calcular", "calcular_combinada"):
             await procesar_combinada(message, state)
             return
-        if "flashscore" in text_lower:
+        if "flashscore" in text_lower or "fotmob" in text_lower:
             data = await state.get_data()
             partidos = data.get("partidos_combinada", [])
             if text in partidos:
@@ -1152,14 +1303,14 @@ async def handle_user_flow(message: Message, state: FSMContext):
             return
         await message.answer(
             f"🎯 Modo Combinada: llevas {len((await state.get_data()).get('partidos_combinada', []))} partidos.\n"
-            f"Envíame enlaces de Flashscore.",
+            f"Envíame enlaces de Flashscore/FotMob.",
             reply_markup=kb_combinada()
         )
         return
 
     # === PRIORIDAD 1: Análisis Individual (fuera de combinada) ===
     # Si es enlace Flashscore y NO está en modo combinada, ejecutar análisis individual de inmediato
-    if "flashscore" in text_lower and current_state != AnalysisStates.collecting_combinada.state:
+    if "flashscore" in text_lower or "fotmob" in text_lower and current_state != AnalysisStates.collecting_combinada.state:
         # No confundirse con estados previos (waiting_for_quota_or_chat), va directo a flujo individual abajo
         pass
     elif current_state in (AnalysisStates.waiting_for_quota_or_chat.state, AnalysisStates.waiting_for_quota.state):
@@ -1178,13 +1329,13 @@ async def handle_user_flow(message: Message, state: FSMContext):
         await message.answer(err_msg)
         return
     url = text
-    if "flashscore" not in url.lower():
+    if "flashscore" not in url.lower() and "fotmob" not in url.lower():
         if url.startswith("http"):
-            await message.answer("⚠️ Por favor envía un enlace válido de Flashscore (debe contener 'flashscore').\nSi quieres evaluar una cuota escríbela así: `1.90 al ambos anotan`\n🎯 Para parlays usa /combinada", reply_markup=kb_proactivo())
+            await message.answer("⚠️ Por favor envía un enlace válido de Flashscore o FotMob (debe contener 'flashscore' o 'fotmob').\nSi quieres evaluar una cuota escríbela así: `1.90 al ambos anotan`\n🎯 Para parlays usa /combinada", reply_markup=kb_proactivo())
         return
     status_msg = await message.answer("🔍 Enlace válido, parcero. Extrayendo vía HTTP ligero (sin navegador)...", reply_markup=kb_proactivo())
     try:
-        scraped_text, minute_live, score_live = await fetch_flashscore_text(url)
+        scraped_text, minute_live, score_live = await fetch_match_data(url)
         if not scraped_text or len(scraped_text.strip()) < 150:
             await status_msg.edit_text("❌ Flashscore bloqueó la lectura del partido, intenta de nuevo")
             return
@@ -1205,7 +1356,7 @@ async def handle_user_flow(message: Message, state: FSMContext):
     await status_msg.edit_text(f"📊 Estadísticas leídas. {live_header}. Analizando con lupa alineaciones y bajas...")
     try:
         model = genai.GenerativeModel(model_name="gemini-1.5-flash", system_instruction=SYSTEM_INSTRUCTION)
-        prompt = f"{live_header}\nDatos extraídos de Flashscore (H2H, alineaciones probables, bajas de jugadores clave, árbitro, tendencias) - Partido: {url}\n\n{scraped_text}\n\n{live_header} - Gemini, usa este minuto/marcador para decidir: si >75' o marcador abultado, prohíbe mercados obsoletos."
+        prompt = f"{live_header}\nDatos extraídos de Flashscore/FotMob (H2H, alineaciones probables, bajas de jugadores clave, árbitro, tendencias) - Partido: {url}\n\n{scraped_text}\n\n{live_header} - Gemini, usa este minuto/marcador para decidir: si >75' o marcador abultado, prohíbe mercados obsoletos."
         response = await asyncio.to_thread(model.generate_content, prompt)
         analysis_result = response.text.strip() if hasattr(response, "text") and response.text else str(response)
         increment_user_usage(telegram_id)
@@ -1229,7 +1380,7 @@ async def process_quota_chat(message: Message, state: FSMContext):
     scraped_text = data.get("scraped_text", "")
     last_url = data.get("last_url", "partido anterior")
     if not scraped_text:
-        await message.answer("⚠️ No tengo contexto del partido, mi hermano. Envíame primero un enlace de Flashscore y luego evaluamos la cuota que quieras.", reply_markup=kb_proactivo())
+        await message.answer("⚠️ No tengo contexto del partido, mi hermano. Envíame primero un enlace de Flashscore/FotMob y luego evaluamos la cuota que quieras.", reply_markup=kb_proactivo())
         await state.set_state(AnalysisStates.waiting_for_link)
         return
     if len(quota_input) < 3:
@@ -1239,7 +1390,7 @@ async def process_quota_chat(message: Message, state: FSMContext):
     try:
         model = genai.GenerativeModel(model_name="gemini-1.5-flash", system_instruction=SYSTEM_INSTRUCTION_CUOTA)
         prompt = (
-            f"Contexto del partido (Flashscore - {last_url}):\n{scraped_text}\n\n"
+            f"Contexto del partido (Flashscore/FotMob - {last_url}):\n{scraped_text}\n\n"
             f"Consulta del usuario - Cuota y mercado a evaluar (BetPlay/Wplay/Codere/Zamba):\n{quota_input}\n\n"
             f"Recuerda: revisa alineaciones y bajas con lupa, calcula 1/Cuota, EV >5% = VALOR. Menciona casa recomendada (BetPlay, Wplay, Codere o Zamba)."
         )
