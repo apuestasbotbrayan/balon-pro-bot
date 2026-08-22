@@ -134,22 +134,15 @@ async def fetch_flashscore_text(url: str) -> tuple[str, str, str]:
         return "", "", ""
 
 async def fetch_fotmob_data(url: str) -> tuple[str, str, str]:
-    """Extrae matchId de URL FotMob y consume https://www.fotmob.com/api/matchDetails?matchId=... via curl_cffi."""
+    """Extracción universal y robusta de matchId de FotMob y consumo de API v1/v2."""
     def _extract_match_id(u: str) -> str:
+        clean_u = u.split("?")[0].split("#")[0]
         m = re.search(r"matchId=([a-zA-Z0-9]+)", u)
         if m:
             return m.group(1)
-        m = re.search(r"/matches/[^/]+/[^/]+/([a-zA-Z0-9]+)", u)
-        if m:
-            return m.group(1)
-        m = re.search(r"/match/([a-zA-Z0-9]+)", u)
-        if m:
-            return m.group(1)
-        # Fallback: último segmento alfanumérico >=5
-        parts = u.rstrip("/").split("/")
+        parts = clean_u.rstrip("/").split("/")
         for part in reversed(parts):
-            part = part.split("#")[0].split("?")[0]
-            if re.match(r"^[a-zA-Z0-9]{5,}$", part) and part.lower() not in ["matches", "match", "fotmob"]:
+            if re.match(r"^[a-zA-Z0-9]{5,}$", part) and part.lower() not in ["matches", "match", "fotmob", "es"]:
                 return part
         return ""
 
@@ -158,18 +151,11 @@ async def fetch_fotmob_data(url: str) -> tuple[str, str, str]:
         headers = dict(HEADERS_CHROME)
         headers["Referer"] = "https://www.fotmob.com/"
         headers["Accept"] = "application/json, text/plain, */*"
-        headers["X-Requested-With"] = "XMLHttpRequest"
         if HAS_CURL and curl_requests is not None:
             try:
                 resp = curl_requests.get(api_url, headers=headers, impersonate="chrome110", timeout=15000)
                 if resp.status_code == 200:
-                    try:
-                        return resp.json()
-                    except Exception:
-                        try:
-                            return json.loads(resp.text)
-                        except Exception:
-                            return {}
+                    return resp.json()
             except Exception:
                 pass
         try:
@@ -182,150 +168,64 @@ async def fetch_fotmob_data(url: str) -> tuple[str, str, str]:
 
     def _format(data: dict) -> tuple[str, str, str]:
         try:
-            # Equipos y liga
             general = data.get("general") or {}
             header = data.get("header") or {}
             content = data.get("content") or {}
-            # Nombres
-            home = general.get("homeTeam") or header.get("homeTeam") or data.get("homeTeam") or {}
-            away = general.get("awayTeam") or header.get("awayTeam") or data.get("awayTeam") or {}
-            if not home.get("name"):
-                # Probar header.teams
-                teams_hdr = header.get("teams") or []
-                if isinstance(teams_hdr, list) and len(teams_hdr) >= 2:
-                    home = teams_hdr[0]
-                    away = teams_hdr[1]
-            home_name = home.get("name") or home.get("shortName") or home.get("teamName") or ""
-            away_name = away.get("name") or away.get("shortName") or away.get("teamName") or ""
-            teams_txt = f"{home_name} vs {away_name}" if home_name and away_name else ""
-            league = general.get("leagueName") or general.get("parentLeagueName") or header.get("leagueName") or data.get("leagueName") or ""
-            if not league:
-                league = content.get("matchFacts", {}).get("leagueName") or ""
-            # Minuto y marcador - múltiples rutas FotMob con distinción pre-partido vs en vivo
-            minute = ""
-            score = ""
-            # Header status
+            
+            home_name = ""
+            away_name = ""
+            teams_hdr = header.get("teams") or []
+            if isinstance(teams_hdr, list) and len(teams_hdr) >= 2:
+                home_name = teams_hdr[0].get("name", "")
+                away_name = teams_hdr[1].get("name", "")
+            
+            if not home_name:
+                home = general.get("homeTeam") or {}
+                away = general.get("awayTeam") or {}
+                home_name = home.get("name", "")
+                away_name = away.get("name", "")
+
+            teams_txt = f"{home_name} vs {away_name}" if home_name and away_name else "Partido FotMob"
+            league = general.get("leagueName", "") or header.get("leagueName", "")
+
+            minute = "No iniciado"
+            score = "0-0"
             status = header.get("status") or general.get("status") or {}
+            
             if isinstance(status, dict):
-                live = status.get("liveTime") or status.get("time") or header.get("liveTime") or general.get("liveTime") or ""
-                if isinstance(live, dict):
-                    minute = live.get("short") or live.get("long") or ""
-                elif live:
-                    minute = str(live)
-                # Score desde header.teams
-                teams_data = header.get("teams") or []
-                if isinstance(teams_data, list) and len(teams_data) >= 2:
-                    try:
-                        hs = teams_data[0].get("score")
-                        aws = teams_data[1].get("score")
-                        if hs is not None and aws is not None:
-                            score = f"{hs}-{aws}"
-                    except Exception:
-                        pass
-            else:
-                if status:
-                    minute = str(status)
-            # Fallback: content
-            if not minute:
-                minute = content.get("liveTime") or data.get("liveTime") or general.get("matchTime") or ""
-                if isinstance(minute, dict):
-                    minute = minute.get("short") or ""
-                minute = str(minute).strip() if minute else ""
-            # Score fallback: buscar en header/general/content
-            if not score:
-                for src in [header, general, content]:
-                    for k in ["score", "result", "scores"]:
-                        v = src.get(k)
-                        if isinstance(v, str) and re.search(r"\d+[-:]\d+", v):
-                            score = v.replace(":", "-").replace(" ", "")
-                            break
-                    if score:
-                        break
-                if not score:
-                    # Buscar en texto JSON pero solo si no es hora
-                    txt_dump = str(data)
-                    m = re.search(r"\b\d+\s*[-:]\s*\d+\b", txt_dump)
-                    if m:
-                        cand = m.group(0).replace(" ", "").replace(":", "-")
-                        # Evitar confundir 19:30 (hora) con marcador
-                        if not re.match(r"^\d{1,2}:\d{2}$", cand) or score:
-                            score = cand
-            # === DETECCIÓN PRE-PARTIDO vs EN VIVO (evitar confundir hora 19:30 con marcador) ===
-            is_pre = False
-            # 1) Flags de FotMob
-            started_flag = general.get("started")
-            if started_flag is None:
-                started_flag = header.get("started")
-            if started_flag is None:
-                started_flag = data.get("started")
-            if started_flag is False:
-                is_pre = True
-            # 2) Status string
-            status_str = ""
-            if isinstance(status, dict):
-                status_str = str(status.get("reason") or status.get("status") or status.get("state") or status.get("started") or "").lower()
-            else:
-                status_str = str(status).lower()
-            if any(k in status_str for k in ["not started", "ns", "scheduled", "pre-match", "pre match", "upcoming", "notstarted"]):
-                is_pre = True
-            # 3) Si minute parece hora 19:30, es pre-partido
-            if minute and re.match(r"^\d{1,2}:\d{2}$", minute.strip()):
-                is_pre = True
-            # 4) Heurística: si no hay liveTime real y started es False/nulo y score vacío
-            if not is_pre:
-                has_live = bool(header.get("liveTime") or general.get("liveTime") or content.get("liveTime"))
-                # Si status indica que no ha empezado y no hay live
-                txt_all = str(data).lower()
-                if not has_live and started_flag is False:
-                    is_pre = True
-                # Si minute es una hora y score parece hora, forzar pre
-                if minute and re.match(r"^\d{1,2}:\d{2}$", minute):
-                    is_pre = True
-            if is_pre:
-                minute = "No iniciado"
-                score = "0-0"
-            else:
-                # Normalizar minuto solo si es en vivo
-                minute = str(minute).strip()
-                if minute and minute.lower() not in ["en vivo", "ht", "ft", "half time", "full time", "finished", "abandoned", "no iniciado"] and minute.isdigit():
-                    minute = minute + "'"
-                if minute and "'" not in minute and re.match(r"^\d{1,3}(\+\d+)?$", minute):
-                    minute = minute + "'"
-            # Construir texto limpio para Gemini con Estado explícito
-            estado_txt = "Pre-partido" if is_pre or minute == "No iniciado" else "En vivo"
-            parts = []
-            if teams_txt:
-                parts.append(f"Partido: {teams_txt}")
-            if league:
-                parts.append(f"Liga: {league}")
-            parts.append(f"Estado: {estado_txt} | Minuto: {minute or 'No iniciado'} | Marcador: {score or '0-0'}")
-            # Añadir contexto para Gemini según estado
-            if is_pre or minute == "No iniciado":
-                parts.append("Contexto: Partido aún no iniciado - evaluar alineaciones probables, bajas, H2H y tendencias con normalidad para mercados pre-partido (goles, córners, tarjetas). PROHIBIDO usar minuto/marcador en vivo.")
-            else:
-                parts.append(f"Contexto: Partido EN VIVO en {minute} con marcador {score} - usar minuto/marcador para decidir mercados lógicos de cierre.")
-            # Estadísticas clave
-            # FotMob content.stats, liveData, matchFacts
-            for key in ["stats", "matchFacts", "lineups", "table", "h2h"]:
-                if key in content and content[key]:
-                    try:
-                        parts.append(f"{key}: {str(content[key])[:900]}")
-                    except Exception:
-                        pass
-            if "stats" in data and data["stats"]:
-                parts.append(f"stats: {str(data['stats'])[:900]}")
-            # Si queda corto, volcar JSON relevante
-            full = "\n".join([p for p in parts if p])
-            if len(full) < 400:
-                # Añadir resumen JSON
-                try:
-                    full += "\nJSON: " + json.dumps(data, ensure_ascii=False)[:2500]
-                except Exception:
-                    full += "\nJSON: " + str(data)[:2500]
-            return full[:4000], minute, score
+                is_started = status.get("started", True)
+                if not is_started:
+                    minute = "No iniciado"
+                else:
+                    live_time = status.get("liveTime") or status.get("time") or {}
+                    if isinstance(live_time, dict):
+                        minute = live_time.get("short") or live_time.get("long") or "En juego"
+                    elif live_time:
+                        minute = str(live_time)
+            
+            if isinstance(teams_hdr, list) and len(teams_hdr) >= 2:
+                hs = teams_hdr[0].get("score")
+                aws = teams_hdr[1].get("score")
+                if hs is not None and aws is not None:
+                    score = f"{hs}-{aws}"
+
+            estado_txt = "Pre-partido" if minute == "No iniciado" else "En vivo"
+            parts = [
+                f"Partido: {teams_txt}",
+                f"Liga: {league}",
+                f"Estado: {estado_txt} | Minuto: {minute} | Marcador: {score}",
+                f"Contexto: {'Partido aún no iniciado - evaluar alineaciones probables, bajas, H2H y tendencias con normalidad para mercados pre-partido' if estado_txt == 'Pre-partido' else f'Partido EN VIVO en {minute} con marcador {score} - usar minuto/marcador para decidir mercados lógicos de cierre.'}"
+            ]
+
+            match_facts = content.get("matchFacts") or {}
+            if match_facts:
+                parts.append(f"Hechos del partido: {str(match_facts)[:600]}")
+
+            full_text = "\n".join(parts)
+            return full_text[:3500], minute, score
         except Exception as e:
-            logging.warning(f"FotMob format error: {e}")
-            return str(data)[:4000], "", ""
+            logging.warning(f"Error formateando JSON FotMob: {e}")
+            return str(data)[:3500], "", ""
 
     mid = _extract_match_id(url)
     if not mid:
