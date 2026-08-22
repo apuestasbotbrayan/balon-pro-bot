@@ -497,6 +497,135 @@ async def cmd_cancelar_combinada(message: Message, state: FSMContext):
 async def cmd_calcular_combinada(message: Message, state: FSMContext):
     await procesar_combinada(message, state)
 
+# --- COMANDO HOY / EN VIVO - PARTIDOS EN DIRECTO ---
+async def ejecutar_analisis_proactivo(url: str, message: Message, state: FSMContext):
+    """Reutiliza el análisis proactivo individual para un URL dado (usado por /hoy y callbacks)."""
+    telegram_id = message.from_user.id
+    allowed, err_msg = check_user_access(telegram_id)
+    if not allowed:
+        await message.answer(err_msg, reply_markup=kb_proactivo())
+        return
+    status_msg = await message.answer("🔍 Enlace de partido en vivo seleccionado, parcero. Extrayendo con Playwright...", reply_markup=kb_proactivo())
+    scraped_text = ""
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"])
+            context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36", viewport={"width": 1280, "height": 800}, locale="es-CO", extra_http_headers={"Accept-Language": "es-ES,es;q=0.9"}, java_script_enabled=True)
+            page = await context.new_page()
+            await asyncio.sleep(random.uniform(1.0, 2.0))
+            await page.goto(url, timeout=60000, wait_until="commit")
+            await asyncio.sleep(random.uniform(2.0, 3.5))
+            try:
+                await page.wait_for_selector("body", timeout=8000)
+            except Exception:
+                pass
+            body_text = await page.inner_text("body")
+            scraped_text = body_text[:3000]
+            await browser.close()
+    except Exception as e:
+        logging.exception(f"Error Playwright hoy: {e}")
+        await status_msg.edit_text("❌ Error al extraer datos del partido en vivo. Intenta con otro enlace, mi hermano.")
+        return
+    if not scraped_text.strip():
+        await status_msg.edit_text("❌ No se pudo extraer contenido del partido.")
+        return
+    await state.update_data(scraped_text=scraped_text, last_url=url)
+    await status_msg.edit_text("📊 Estadísticas leídas. Analizando con lupa alineaciones y bajas...")
+    try:
+        model = genai.GenerativeModel(model_name="gemini-3.6-flash", system_instruction=SYSTEM_INSTRUCTION)
+        prompt = f"Datos extraídos de Flashscore (H2H, alineaciones probables, bajas de jugadores clave, árbitro, tendencias) - Partido: {url}\n\n{scraped_text}"
+        response = await asyncio.to_thread(model.generate_content, prompt)
+        analysis_result = response.text.strip() if hasattr(response, "text") and response.text else str(response)
+        increment_user_usage(telegram_id)
+        await message.answer(analysis_result, reply_markup=kb_proactivo())
+        await state.set_state(AnalysisStates.waiting_for_quota_or_chat)
+        await status_msg.delete()
+    except Exception as e:
+        logging.exception(f"Error Gemini hoy: {e}")
+        await status_msg.edit_text("❌ Error al conectar con Gemini para el análisis. Intenta de nuevo, parcero.")
+        await state.set_state(AnalysisStates.waiting_for_quota_or_chat)
+
+@router.message(Command(commands=["hoy", "en_vivo", "envivo"]))
+async def cmd_hoy(message: Message, state: FSMContext):
+    telegram_id = message.from_user.id
+    allowed, err_msg = check_user_valid(telegram_id)
+    if not allowed:
+        await message.answer(err_msg)
+        return
+    status_msg = await message.answer("🔍 Buscando partidos en vivo en Flashscore, parcero... dame 10 segunditos ⏳")
+    partidos = []
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"])
+            context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36", viewport={"width": 1280, "height": 800}, locale="es-CO", extra_http_headers={"Accept-Language": "es-ES,es;q=0.9"}, java_script_enabled=True)
+            page = await context.new_page()
+            await asyncio.sleep(random.uniform(1.0, 2.0))
+            await page.goto("https://www.flashscore.co/en-vivo/", timeout=60000, wait_until="commit")
+            await asyncio.sleep(random.uniform(3.0, 5.0))
+            try:
+                await page.wait_for_selector("body", timeout=10000)
+            except Exception:
+                pass
+            # Extraer enlaces de partidos en vivo
+            try:
+                partidos = await page.evaluate("""() => {
+                    const anchors = Array.from(document.querySelectorAll('a[href*="/partido/"], a[href*="/match/"]'));
+                    const seen = new Set();
+                    const result = [];
+                    for (const a of anchors) {
+                        let href = a.href;
+                        if (!href || seen.has(href)) continue;
+                        if (!href.includes('/partido/') && !href.includes('/match/')) continue;
+                        seen.add(href);
+                        let text = a.innerText.trim() || a.textContent.trim();
+                        if (!text || text.length < 3) {
+                            text = a.getAttribute('aria-label') || href.split('/').filter(Boolean).pop() || 'Partido';
+                        }
+                        text = text.replace(/\\s+/g, ' ').trim();
+                        if (text.length > 40) text = text.substring(0, 40) + '…';
+                        result.push({href, text});
+                        if (result.length >= 12) break;
+                    }
+                    // Fallback: busca por contenedores de eventos si no hay anchors
+                    if (result.length === 0) {
+                        const divs = Array.from(document.querySelectorAll('[id^="g_"] a, .event__match a'));
+                        for (const a of divs) {
+                            let href = a.href;
+                            if (!href || seen.has(href)) continue;
+                            seen.add(href);
+                            let text = a.innerText.trim();
+                            if (text.length < 3) continue;
+                            result.push({href, text: text.substring(0,40)});
+                            if (result.length >= 12) break;
+                        }
+                    }
+                    return result;
+                }""")
+            except Exception as e:
+                partidos = []
+            await browser.close()
+    except Exception as e:
+        logging.exception(f"Error Playwright /hoy: {e}")
+        await status_msg.edit_text("❌ Error al conectar con Flashscore en vivo. Intenta de nuevo en unos segundos, mi hermano.")
+        return
+    if not partidos:
+        await status_msg.edit_text("⚠️ No encontré partidos en vivo en este momento, parcero. Puede que no haya juegos ahora o Flashscore bloqueó la lectura. Prueba enviando un enlace directo de Flashscore o intenta /hoy en unos minutos.", reply_markup=kb_proactivo())
+        return
+    # Guardar en FSM para callbacks
+    await state.update_data(partidos_hoy=partidos)
+    await status_msg.delete()
+    kb = InlineKeyboardMarkup(inline_keyboard=[])
+    for idx, partido in enumerate(partidos):
+        btn_text = partido['text'][:35] if len(partido['text']) <= 35 else partido['text'][:32] + "…"
+        kb.inline_keyboard.append([InlineKeyboardButton(text=f"⚽ {btn_text}", callback_data=f"hoy_{idx}")])
+    kb.inline_keyboard.append([InlineKeyboardButton(text="🔄 Actualizar", callback_data="hoy_refresh"), InlineKeyboardButton(text="❌ Cerrar", callback_data="hoy_close")])
+    await message.answer(
+        f"🔥 *Partidos en vivo encontrados ({len(partidos)}), mi hermano!*\n"
+        f"Toca uno y te hago el análisis proactivo de una (alineaciones con lupa + casas BetPlay/Wplay/Codere/Zamba):",
+        parse_mode="Markdown",
+        reply_markup=kb
+    )
+
 async def procesar_combinada(message: Message, state: FSMContext):
     telegram_id = message.from_user.id
     data = await state.get_data()
@@ -515,13 +644,13 @@ async def procesar_combinada(message: Message, state: FSMContext):
     textos_combinados = []
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+            browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"])
+            context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36", viewport={"width": 1280, "height": 800}, locale="es-CO", extra_http_headers={"Accept-Language": "es-ES,es;q=0.9"}, java_script_enabled=True)
             for idx, url in enumerate(partidos, 1):
                 try:
                     page = await context.new_page()
                     await asyncio.sleep(random.uniform(1.0, 2.5))
-                    await page.goto(url, timeout=60000, wait_until="domcontentloaded")
+                    await page.goto(url, timeout=60000, wait_until="commit")
                     await asyncio.sleep(random.uniform(1.5, 3.0))
                     try:
                         await page.wait_for_selector("body", timeout=8000)
@@ -616,6 +745,62 @@ async def cb_cancelar_combinada(callback: CallbackQuery, state: FSMContext):
     await callback.message.answer("❌ Combinada cancelada. Modo normal activado, parcero.", reply_markup=kb_proactivo())
     await callback.message.edit_reply_markup(reply_markup=None)
 
+# --- CALLBACKS HOY / EN VIVO ---
+@router.callback_query(F.data.startswith("hoy_"))
+async def cb_hoy_selector(callback: CallbackQuery, state: FSMContext):
+    data = callback.data
+    if data == "hoy_refresh":
+        await callback.answer("Actualizando... ⏳")
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+        # Re-ejecutar /hoy correctamente con el usuario que clickeó
+        # Usamos el mismo callback.message pero forzamos el check con callback.from_user
+        class _FakeMsg:
+            def __init__(self, msg, user):
+                self._msg = msg
+                self.from_user = user
+                self.chat = msg.chat
+            def __getattr__(self, name):
+                return getattr(self._msg, name)
+            async def answer(self, *a, **kw):
+                return await self._msg.answer(*a, **kw)
+        fake = _FakeMsg(callback.message, callback.from_user)
+        await cmd_hoy(fake, state)
+        return
+    if data == "hoy_close":
+        await callback.answer()
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await callback.message.answer("✅ Cerrado, parcero. Usa /hoy cuando quieras ver los en vivo.", reply_markup=kb_proactivo())
+        return
+    # Caso hoy_0, hoy_1 ... -> análisis proactivo
+    if data.startswith("hoy_") and data[4:].isdigit():
+        try:
+            idx = int(data.split("_")[1])
+        except Exception:
+            await callback.answer("Error al leer partido")
+            return
+        fsm_data = await state.get_data()
+        partidos = fsm_data.get("partidos_hoy", [])
+        if idx < 0 or idx >= len(partidos):
+            await callback.answer("Partido ya no disponible, actualiza con /hoy", show_alert=True)
+            return
+        url = partidos[idx].get("href")
+        nombre = partidos[idx].get("text", f"Partido {idx+1}")
+        await callback.answer(f"Analizando {nombre[:25]}... ⏳")
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await callback.message.answer(f"⚽ Elegiste: *{nombre}*\n🔗 {url}\n\nIniciando análisis proactivo...", parse_mode="Markdown")
+        await ejecutar_analisis_proactivo(url, callback.message, state)
+        return
+    await callback.answer()
+
 # --- Flujo principal proactivo ---
 @router.message(F.text & ~F.text.startswith("/"))
 async def handle_user_flow(message: Message, state: FSMContext):
@@ -678,11 +863,11 @@ async def handle_user_flow(message: Message, state: FSMContext):
     scraped_text = ""
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+            browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"])
+            context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36", viewport={"width": 1280, "height": 800}, locale="es-CO", extra_http_headers={"Accept-Language": "es-ES,es;q=0.9"}, java_script_enabled=True)
             page = await context.new_page()
             await asyncio.sleep(random.uniform(1.0, 3.0))
-            await page.goto(url, timeout=60000, wait_until="domcontentloaded")
+            await page.goto(url, timeout=60000, wait_until="commit")
             await asyncio.sleep(random.uniform(2.0, 4.5))
             try:
                 await page.wait_for_selector("body", timeout=10000)
