@@ -515,8 +515,8 @@ async def ejecutar_analisis_proactivo(url: str, message: Message, state: FSMCont
     scraped_text = ""
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"])
-            context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36", viewport={"width": 1280, "height": 800}, locale="es-CO", extra_http_headers={"Accept-Language": "es-ES,es;q=0.9"}, java_script_enabled=True)
+            browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"])
+            context = await browser.new_context(viewport={"width": 1280, "height": 800}, locale="es-CO", extra_http_headers={"Accept-Language": "es-ES,es;q=0.9"}, java_script_enabled=True, ignore_https_errors=True)
             page = await context.new_page()
             await stealth_async(page)
             await asyncio.sleep(random.uniform(1.0, 2.0))
@@ -524,7 +524,7 @@ async def ejecutar_analisis_proactivo(url: str, message: Message, state: FSMCont
             await asyncio.sleep(random.uniform(2.0, 3.5))
             # 1) Esperar contenedor específico #detail (funciona en vivo y pre-partido) - NO body
             try:
-                await page.wait_for_selector('#detail, .container__detail', timeout=10000)
+                await page.wait_for_selector('#detail, .container__detail', timeout=30000)
             except Exception as e:
                 logging.warning(f"Flashscore bloqueó lectura (timeout #detail): {e}")
                 try:
@@ -614,8 +614,8 @@ async def cmd_hoy(message: Message, state: FSMContext):
     partidos = []
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"])
-            context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36", viewport={"width": 1280, "height": 800}, locale="es-CO", extra_http_headers={"Accept-Language": "es-ES,es;q=0.9"}, java_script_enabled=True)
+            browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"])
+            context = await browser.new_context(viewport={"width": 1280, "height": 800}, locale="es-CO", extra_http_headers={"Accept-Language": "es-ES,es;q=0.9"}, java_script_enabled=True, ignore_https_errors=True)
             page = await context.new_page()
             await stealth_async(page)
             await asyncio.sleep(random.uniform(1.0, 2.0))
@@ -956,8 +956,8 @@ async def procesar_combinada(message: Message, state: FSMContext):
     textos_combinados = []
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"])
-            context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36", viewport={"width": 1280, "height": 800}, locale="es-CO", extra_http_headers={"Accept-Language": "es-ES,es;q=0.9"}, java_script_enabled=True)
+            browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"])
+            context = await browser.new_context(viewport={"width": 1280, "height": 800}, locale="es-CO", extra_http_headers={"Accept-Language": "es-ES,es;q=0.9"}, java_script_enabled=True, ignore_https_errors=True)
             for idx, url in enumerate(partidos, 1):
                 try:
                     page = await context.new_page()
@@ -1176,8 +1176,8 @@ async def handle_user_flow(message: Message, state: FSMContext):
     scraped_text = ""
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"])
-            context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36", viewport={"width": 1280, "height": 800}, locale="es-CO", extra_http_headers={"Accept-Language": "es-ES,es;q=0.9"}, java_script_enabled=True)
+            browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"])
+            context = await browser.new_context(viewport={"width": 1280, "height": 800}, locale="es-CO", extra_http_headers={"Accept-Language": "es-ES,es;q=0.9"}, java_script_enabled=True, ignore_https_errors=True)
             page = await context.new_page()
             await stealth_async(page)
             await asyncio.sleep(random.uniform(1.0, 3.0))
@@ -1185,7 +1185,7 @@ async def handle_user_flow(message: Message, state: FSMContext):
             await asyncio.sleep(random.uniform(2.0, 4.5))
             # 1) Esperar contenedor específico #detail (vivo y pre-partido) - NO body
             try:
-                await page.wait_for_selector('#detail, .container__detail', timeout=10000)
+                await page.wait_for_selector('#detail, .container__detail', timeout=30000)
             except Exception as e:
                 logging.warning(f"Flashscore bloqueó lectura (timeout #detail): {e}")
                 try:
