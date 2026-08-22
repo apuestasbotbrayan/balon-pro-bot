@@ -552,7 +552,7 @@ async def cmd_hoy(message: Message, state: FSMContext):
     if not allowed:
         await message.answer(err_msg)
         return
-    status_msg = await message.answer("🔍 Buscando partidos en vivo en Flashscore, parcero... dame 10 segunditos ⏳")
+    status_msg = await message.answer("🔍 Buscando partidos del día en Flashscore (en vivo + programados), parcero... filtrando los de mayor valor para ti ⏳")
     partidos = []
     try:
         async with async_playwright() as p:
@@ -560,22 +560,50 @@ async def cmd_hoy(message: Message, state: FSMContext):
             context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36", viewport={"width": 1280, "height": 800}, locale="es-CO", extra_http_headers={"Accept-Language": "es-ES,es;q=0.9"}, java_script_enabled=True)
             page = await context.new_page()
             await asyncio.sleep(random.uniform(1.0, 2.0))
-            await page.goto("https://www.flashscore.co/en-vivo/", timeout=60000, wait_until="commit")
-            await asyncio.sleep(random.uniform(3.0, 5.0))
+            await page.goto("https://www.flashscore.co/", timeout=60000, wait_until="commit")
+            await asyncio.sleep(random.uniform(4.0, 6.0))
             try:
-                await page.wait_for_selector('.event__match, [id^="g_1"], .sportName', timeout=10000)
+                await page.wait_for_selector('.event__match, [id^="g_1"], .sportName', timeout=12000)
             except Exception:
                 try:
                     await page.wait_for_selector("body", timeout=5000)
                 except Exception:
                     pass
-            # Extraer enlaces distinguiendo EN VIVO vs PROGRAMADO - SELECTORES PRECISOS EN DIRECTO
+            # Extraer TODOS los partidos del día con lógica de VALOR/RELEVANCIA
             try:
                 partidos = await page.evaluate("""() => {
                     const seen = new Set();
                     const raw = [];
 
-                    // 1) Prioridad: contenedores oficiales de partidos en vivo
+                    const getLeagueScore = (text) => {
+                        const t = (text || '').toUpperCase();
+                        if (/PRIMERA A|BETPLAY|DIMAYOR|COLOMBIA.*PRIMERA/.test(t)) return 100;
+                        if (/PREMIER LEAGUE|LA LIGA|LALIGA|SERIE A|BUNDESLIGA|LIGUE 1|CHAMPIONS|LIBERTADORES|EUROPA LEAGUE|BRASILEIRAO|SUDAMERICANA|LIGA MX|CLASICO|DERBY/.test(t)) return 95;
+                        if (/PRIMERA B|COPA LIBERTADORES|COPA SUDAMERICANA|EREDIVISIE|PRIMEIRA LIGA|CHAMPIONSHIP|MLS|ARGENTINA.*PRIMERA/.test(t)) return 70;
+                        if (/AMISTOSO|FRIENDLY|RESERVA|SUB-?19|SUB-?20|FEMENINO|TERCERA|SEGUNDA B|REGIONAL/.test(t)) return 10;
+                        return 35;
+                    };
+
+                    const getLeagueText = (container) => {
+                        let parent = container.parentElement;
+                        let tries = 0;
+                        while (parent && tries < 6) {
+                            const header = parent.querySelector('.event__header, .sportName');
+                            if (header && header.innerText.trim().length > 3) return header.innerText.trim();
+                            // Buscar hermano previo
+                            let prev = container.previousElementSibling;
+                            let pt = 0;
+                            while (prev && pt < 4) {
+                                if (prev.matches && prev.matches('.event__header, .sportName')) return prev.innerText.trim();
+                                prev = prev.previousElementSibling; pt++;
+                            }
+                            parent = parent.parentElement;
+                            tries++;
+                        }
+                        return '';
+                    };
+
+                    // Capturar TODOS: en vivo + programados de la jornada
                     const containers = Array.from(document.querySelectorAll('.event__match, .event__game, [id^="g_1"] div.event__match, li.event__match'));
                     const anchorsFallback = Array.from(document.querySelectorAll('a[href*="/partido/"], a[href*="/match/"]'));
 
@@ -589,7 +617,6 @@ async def cmd_hoy(message: Message, state: FSMContext):
                         if (!href.includes('/partido/') && !href.includes('/match/')) return;
                         seen.add(href);
 
-                        // Selectores precisos Flashscore
                         const timeEl = container.querySelector('.event__time, .event__stage, [class*="event__time"]');
                         const scoreEl = container.querySelector('.event__score, .event__scores, [class*="event__score"]');
                         const participantEls = container.querySelectorAll('.event__participant, .event__participant--home, .event__participant--away, [class*="participant"]');
@@ -597,7 +624,6 @@ async def cmd_hoy(message: Message, state: FSMContext):
                         let timeText = timeEl ? timeEl.innerText.trim() : '';
                         let scoreText = scoreEl ? scoreEl.innerText.trim().replace(/\\s+/g,' ') : '';
 
-                        // Fallback: si no hay timeEl/scoreEl, usar texto del contenedor
                         let containerText = container.innerText.replace(/\\s+/g,' ').trim();
                         if (!timeText) {
                             let m = containerText.match(/\\b\\d{1,3}(?:\\+\\d+)?'?\\b/);
@@ -608,24 +634,19 @@ async def cmd_hoy(message: Message, state: FSMContext):
                             if (sm) scoreText = sm[0];
                         }
 
-                        // Minuto: 90+6, 86, 30, 45+2'  (con o sin apóstrofe)
                         let minute = null;
                         let time = null;
                         if (/^\\d{1,3}(\\+\\d+)?'?$/.test(timeText.trim())) {
                             minute = timeText.trim();
-                            // Normalizar sin apóstrofe -> agregar '
                             if (!minute.includes("'")) minute = minute + "'";
                         } else if (/^\\d{1,2}:\\d{2}$/.test(timeText.trim())) {
                             time = timeText.trim();
                         } else {
-                            // Detectar dentro de containerText
                             let minuteMatch = containerText.match(/(\\d{1,3}(?:\\+\\d+)?')/);
                             if (minuteMatch) minute = minuteMatch[1];
                             else {
                                 let minuteNoApos = containerText.match(/\\b(\\d{1,3}(?:\\+\\d+)?)\\b/);
-                                // Evitar confundir con score/hora - solo si parece minuto vivo
                                 if (minuteNoApos && parseInt(minuteNoApos[1]) <= 130 && !containerText.includes(':')) {
-                                    // validación extra: si hay marcador cerca, es minuto
                                     if (scoreText) minute = minuteNoApos[1] + "'";
                                 }
                             }
@@ -633,7 +654,6 @@ async def cmd_hoy(message: Message, state: FSMContext):
                             if (timeMatch) time = timeMatch[1];
                         }
 
-                        // Goles actuales: normalizar a X-Y
                         let score = null;
                         if (scoreText) {
                             let s = scoreText.match(/(\\d+)\\s*[-:]\\s*(\\d+)/);
@@ -644,7 +664,6 @@ async def cmd_hoy(message: Message, state: FSMContext):
                             if (sm) score = `${sm[1]}-${sm[2]}`;
                         }
 
-                        // Equipos: preciso desde .event__participant
                         let teams = '';
                         if (participantEls.length >= 2) {
                             teams = Array.from(participantEls).slice(0,2).map(e=>e.innerText.trim()).filter(Boolean).join(' vs ');
@@ -663,8 +682,12 @@ async def cmd_hoy(message: Message, state: FSMContext):
 
                         let isLive = !!minute || /en vivo|live|en juego/i.test(containerText) || !!scoreEl;
                         if (score && minute) isLive = true;
-                        // En la pestaña EN DIRECTO, todo lo listado es vivo por defecto si tiene minuto/score
                         if (!isLive && (score || minute)) isLive = true;
+
+                        // Lógica de VALOR/RELEVANCIA: prioriza Ligas Pro / Primera A, clásicos y alta expectativa de goles
+                        let leagueText = getLeagueText(container);
+                        let leagueScore = getLeagueScore(leagueText + ' ' + containerText + ' ' + teams + ' ' + href);
+                        if (/NACIONAL|MILLONARIOS|AMERICA.*CALI|JUNIOR|SANT A FE|MEDELLIN|BOCA|RIVER|FLAMENGO|PALMEIRAS|CLASICO|DERBY/.test(teams.toUpperCase())) leagueScore += 8;
 
                         let display = '';
                         if (isLive && minute && score) {
@@ -688,31 +711,30 @@ async def cmd_hoy(message: Message, state: FSMContext):
                             sortKey = h*60 + mi;
                         }
                         let attractive = (isLive && score && score !== '0-0') ? 1 : 0;
-                        raw.push({href, text: display, isLive, time, score, minute, sortKey, attractive});
+                        raw.push({href, text: display, isLive, time, score, minute, sortKey, attractive, leagueScore, leagueText});
                     };
 
-                    // Procesar contenedores oficiales primero
+                    // Capturar TODOS los partidos del día (en vivo + programados) para filtrar por valor
                     for (const c of containers) {
                         processContainer(c);
-                        if (raw.length >= 18) break;
+                        if (raw.length >= 30) break;
                     }
-                    // Fallback: anchors si no se llenó
-                    if (raw.length < 4) {
+                    if (raw.length < 6) {
                         for (const a of anchorsFallback) {
                             processContainer(a.closest('.event__match') || a.parentElement?.parentElement || a, a.href);
-                            if (raw.length >= 18) break;
+                            if (raw.length >= 30) break;
                         }
                     }
 
+                    // Orden inteligente: en vivo primero (con minuto/marcador), luego por VALOR de liga, atractivo y hora
                     raw.sort((a,b) => {
                         if (a.isLive && !b.isLive) return -1;
                         if (!a.isLive && b.isLive) return 1;
-                        if (a.isLive && b.isLive) {
-                            if (a.attractive !== b.attractive) return b.attractive - a.attractive;
-                            return a.sortKey - b.sortKey;
-                        }
+                        if (a.leagueScore !== b.leagueScore) return b.leagueScore - a.leagueScore;
+                        if (a.attractive !== b.attractive) return b.attractive - a.attractive;
                         return a.sortKey - b.sortKey;
                     });
+                    // Seleccionar los 10-12 más atractivos (prioriza Ligas Pro / Primera A y clásicos)
                     let result = raw.slice(0,12).map(({href,text,isLive})=>({href,text,isLive}));
                     if (result.length === 0) {
                         // Último fallback: cualquier a en g_1
@@ -752,11 +774,11 @@ async def cmd_hoy(message: Message, state: FSMContext):
             btn_text = btn_text[:35] + "…"
         kb.inline_keyboard.append([InlineKeyboardButton(text=f"{prefix} {btn_text}", callback_data=f"hoy_{idx}")])
     kb.inline_keyboard.append([InlineKeyboardButton(text="🔄 Actualizar", callback_data="hoy_refresh"), InlineKeyboardButton(text="❌ Cerrar", callback_data="hoy_close")])
-    header = f"🔥 *En vivo: {cnt_vivo} | Programados: {cnt_prog} - Total {len(partidos)}*"
+    header = f"🔥 *Top {len(partidos)} más atractivos del día — En vivo: {cnt_vivo} | Programados: {cnt_prog}*"
     await message.answer(
         f"{header}\n"
-        f"Formato: `62' [0-3] Equipo vs Equipo` = en vivo con minuto y marcador | `15:00 - Equipo vs Equipo` = por empezar\n"
-        f"Toca uno, parcero, y te hago el análisis proactivo con lupa en alineaciones + casa recomendada:",
+        f"Prioricé Primera A / Ligas Pro, clásicos y partidos con más expectativa de goles. Formato: `62' [0-3] Equipo vs Equipo` = en vivo | `15:00 - Equipo vs Equipo` = próximo\n"
+        f"Toca uno, parcero, y te hago el análisis proactivo con lupa en alineaciones + casa recomendada (BetPlay/Wplay/Codere/Zamba):",
         parse_mode="Markdown",
         reply_markup=kb
     )
