@@ -1,4 +1,6 @@
 aiogram==3.13.1
-google-generativeai==0.8.6
-playwright==1.62.0
+google-generativeai==0.8.4
+playwright==1.48.0
 flask==3.0.3
+pydantic==2.9.2
+pydantic-core==2.23.1
