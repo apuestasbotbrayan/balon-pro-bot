@@ -521,11 +521,27 @@ async def ejecutar_analisis_proactivo(url: str, message: Message, state: FSMCont
             await page.goto(url, timeout=60000, wait_until="commit")
             await asyncio.sleep(random.uniform(2.0, 3.5))
             try:
-                await page.wait_for_selector("body", timeout=8000)
-            except Exception:
-                pass
+                await page.wait_for_selector('.duelParticipant, .detailScore__wrapper, .matchHistory', timeout=15000)
+            except Exception as e:
+                logging.warning(f"Flashscore bloqueó lectura (timeout elementos reales): {e}")
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+                await status_msg.edit_text("❌ Flashscore bloqueó la lectura del partido, intenta de nuevo")
+                return
             body_text = await page.inner_text("body")
             scraped_text = body_text[:3000]
+            # Validar que no sea solo menú genérico
+            _low = scraped_text.lower()
+            _has_stats = any(k in _low for k in ["h2h", "historial", "alineación", "alineacion", "árbitro", "arbitro", "estadística", "estadistica", "duelparticipant", "head to head", "corners", "córners", "posesión", "posesion", "tarjetas", "goles", "matchhistory", "detail"])
+            if len(scraped_text.strip()) < 350 or not _has_stats:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+                await status_msg.edit_text("❌ Flashscore bloqueó la lectura del partido, intenta de nuevo")
+                return
             # === EXTRACCIÓN OBLIGATORIA MINUTO Y MARCADOR EN VIVO ===
             try:
                 live_info = await page.evaluate("""() => {
@@ -1150,11 +1166,26 @@ async def handle_user_flow(message: Message, state: FSMContext):
             await page.goto(url, timeout=60000, wait_until="commit")
             await asyncio.sleep(random.uniform(2.0, 4.5))
             try:
-                await page.wait_for_selector("body", timeout=10000)
-            except Exception:
-                pass
+                await page.wait_for_selector('.duelParticipant, .detailScore__wrapper, .matchHistory', timeout=15000)
+            except Exception as e:
+                logging.warning(f"Flashscore bloqueó lectura (timeout elementos reales): {e}")
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+                await status_msg.edit_text("❌ Flashscore bloqueó la lectura del partido, intenta de nuevo")
+                return
             body_text = await page.inner_text("body")
             scraped_text = body_text[:3000]
+            _low = scraped_text.lower()
+            _has_stats = any(k in _low for k in ["h2h", "historial", "alineación", "alineacion", "árbitro", "arbitro", "estadística", "estadistica", "duelparticipant", "head to head", "corners", "córners", "posesión", "posesion", "tarjetas", "goles", "matchhistory", "detail"])
+            if len(scraped_text.strip()) < 350 or not _has_stats:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+                await status_msg.edit_text("❌ Flashscore bloqueó la lectura del partido, intenta de nuevo")
+                return
             # === EXTRACCIÓN OBLIGATORIA MINUTO Y MARCADOR EN VIVO ===
             try:
                 live_info = await page.evaluate("""() => {
