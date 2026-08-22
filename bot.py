@@ -201,7 +201,7 @@ async def fetch_fotmob_data(url: str) -> tuple[str, str, str]:
             league = general.get("leagueName") or general.get("parentLeagueName") or header.get("leagueName") or data.get("leagueName") or ""
             if not league:
                 league = content.get("matchFacts", {}).get("leagueName") or ""
-            # Minuto y marcador - múltiples rutas FotMob
+            # Minuto y marcador - múltiples rutas FotMob con distinción pre-partido vs en vivo
             minute = ""
             score = ""
             # Header status
@@ -242,24 +242,68 @@ async def fetch_fotmob_data(url: str) -> tuple[str, str, str]:
                     if score:
                         break
                 if not score:
-                    # Buscar en texto JSON
+                    # Buscar en texto JSON pero solo si no es hora
                     txt_dump = str(data)
                     m = re.search(r"\b\d+\s*[-:]\s*\d+\b", txt_dump)
                     if m:
-                        score = m.group(0).replace(" ", "").replace(":", "-")
-            # Normalizar minuto
-            minute = str(minute).strip()
-            if minute and minute.lower() not in ["en vivo", "ht", "ft", "half time", "full time", "finished", "abandoned"] and minute.isdigit():
-                minute = minute + "'"
-            if minute and "'" not in minute and re.match(r"^\d{1,3}(\+\d+)?$", minute):
-                minute = minute + "'"
-            # Construir texto limpio para Gemini
+                        cand = m.group(0).replace(" ", "").replace(":", "-")
+                        # Evitar confundir 19:30 (hora) con marcador
+                        if not re.match(r"^\d{1,2}:\d{2}$", cand) or score:
+                            score = cand
+            # === DETECCIÓN PRE-PARTIDO vs EN VIVO (evitar confundir hora 19:30 con marcador) ===
+            is_pre = False
+            # 1) Flags de FotMob
+            started_flag = general.get("started")
+            if started_flag is None:
+                started_flag = header.get("started")
+            if started_flag is None:
+                started_flag = data.get("started")
+            if started_flag is False:
+                is_pre = True
+            # 2) Status string
+            status_str = ""
+            if isinstance(status, dict):
+                status_str = str(status.get("reason") or status.get("status") or status.get("state") or status.get("started") or "").lower()
+            else:
+                status_str = str(status).lower()
+            if any(k in status_str for k in ["not started", "ns", "scheduled", "pre-match", "pre match", "upcoming", "notstarted"]):
+                is_pre = True
+            # 3) Si minute parece hora 19:30, es pre-partido
+            if minute and re.match(r"^\d{1,2}:\d{2}$", minute.strip()):
+                is_pre = True
+            # 4) Heurística: si no hay liveTime real y started es False/nulo y score vacío
+            if not is_pre:
+                has_live = bool(header.get("liveTime") or general.get("liveTime") or content.get("liveTime"))
+                # Si status indica que no ha empezado y no hay live
+                txt_all = str(data).lower()
+                if not has_live and started_flag is False:
+                    is_pre = True
+                # Si minute es una hora y score parece hora, forzar pre
+                if minute and re.match(r"^\d{1,2}:\d{2}$", minute):
+                    is_pre = True
+            if is_pre:
+                minute = "No iniciado"
+                score = "0-0"
+            else:
+                # Normalizar minuto solo si es en vivo
+                minute = str(minute).strip()
+                if minute and minute.lower() not in ["en vivo", "ht", "ft", "half time", "full time", "finished", "abandoned", "no iniciado"] and minute.isdigit():
+                    minute = minute + "'"
+                if minute and "'" not in minute and re.match(r"^\d{1,3}(\+\d+)?$", minute):
+                    minute = minute + "'"
+            # Construir texto limpio para Gemini con Estado explícito
+            estado_txt = "Pre-partido" if is_pre or minute == "No iniciado" else "En vivo"
             parts = []
             if teams_txt:
                 parts.append(f"Partido: {teams_txt}")
             if league:
                 parts.append(f"Liga: {league}")
-            parts.append(f"Minuto: {minute or 'No iniciado'} | Marcador: {score or '0-0'}")
+            parts.append(f"Estado: {estado_txt} | Minuto: {minute or 'No iniciado'} | Marcador: {score or '0-0'}")
+            # Añadir contexto para Gemini según estado
+            if is_pre or minute == "No iniciado":
+                parts.append("Contexto: Partido aún no iniciado - evaluar alineaciones probables, bajas, H2H y tendencias con normalidad para mercados pre-partido (goles, córners, tarjetas). PROHIBIDO usar minuto/marcador en vivo.")
+            else:
+                parts.append(f"Contexto: Partido EN VIVO en {minute} con marcador {score} - usar minuto/marcador para decidir mercados lógicos de cierre.")
             # Estadísticas clave
             # FotMob content.stats, liveData, matchFacts
             for key in ["stats", "matchFacts", "lineups", "table", "h2h"]:
