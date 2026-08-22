@@ -850,7 +850,7 @@ async def ejecutar_analisis_proactivo(url: str, message: Message, state: FSMCont
             # Enviar igual a Gemini si tiene algo, pero advertir; por ahora abortar para no gastar tokens en basura
             await status_msg.edit_text("❌ Flashscore bloqueó la lectura del partido, intenta de nuevo")
             return
-        live_header = f"MINUTO ACTUAL: {minute_live if minute_live else 'No iniciado / Sin dato'} | MARCADOR EN VIVO: {score_live if score_live else ('0-0 (programado)' if not minute_live else 'No detectado')}"
+        # scraped_text ya trae Estado/Minuto/Marcador formateados correctamente desde fetch_match_data - no reconstruir live_header
     except Exception as e:
         logging.exception(f"Error HTTP ligero: {e}")
         await status_msg.edit_text("❌ Error al extraer datos del partido. Intenta con otro enlace, mi hermano.")
@@ -858,11 +858,11 @@ async def ejecutar_analisis_proactivo(url: str, message: Message, state: FSMCont
     if not scraped_text.strip():
         await status_msg.edit_text("❌ No se pudo extraer contenido del partido.")
         return
-    await state.update_data(scraped_text=f"{live_header}\n{scraped_text}", last_url=url, minute_live=minute_live, score_live=score_live)
-    await status_msg.edit_text(f"📊 Estadísticas leídas. {live_header}. Analizando con lupa alineaciones y bajas...")
+    await state.update_data(scraped_text=scraped_text, last_url=url, minute_live=minute_live, score_live=score_live)
+    await status_msg.edit_text(f"📊 Datos listos. Analizando con lupa alineaciones y bajas...")
     try:
         model = genai.GenerativeModel(model_name="gemini-1.5-flash", system_instruction=SYSTEM_INSTRUCTION)
-        prompt = f"{live_header}\nDatos extraídos de Flashscore/FotMob (H2H, alineaciones probables, bajas de jugadores clave, árbitro, tendencias) - Partido: {url}\n\n{scraped_text}\n\n{live_header} - Gemini, usa este minuto/marcador para decidir: si >75' o marcador abultado, prohíbe mercados obsoletos."
+        prompt = f"Datos extraídos (Flashscore/FotMob) - Partido: {url}\n\n{scraped_text}\n\nUsa el Estado/Minuto/Marcador del texto para decidir: si >75' o marcador abultado, prohíbe mercados obsoletos."
         response = await asyncio.to_thread(model.generate_content, prompt)
         analysis_result = response.text.strip() if hasattr(response, "text") and response.text else str(response)
         increment_user_usage(telegram_id)
@@ -1388,7 +1388,7 @@ async def handle_user_flow(message: Message, state: FSMContext):
         if len(scraped_text.strip()) < 150 or not _has_stats:
             await status_msg.edit_text("❌ Flashscore bloqueó la lectura del partido, intenta de nuevo")
             return
-        live_header = f"MINUTO ACTUAL: {minute_live if minute_live else 'No iniciado / Sin dato'} | MARCADOR EN VIVO: {score_live if score_live else ('0-0 (programado)' if not minute_live else 'No detectado')}"
+        # scraped_text ya trae Estado/Minuto/Marcador formateados correctamente desde fetch_match_data - no reconstruir live_header
     except Exception as e:
         logging.exception(f"Error HTTP ligero: {e}")
         await status_msg.edit_text("❌ Error al extraer datos del partido. Intenta de nuevo, parcero.")
@@ -1396,11 +1396,11 @@ async def handle_user_flow(message: Message, state: FSMContext):
     if not scraped_text.strip():
         await status_msg.edit_text("❌ No se pudo extraer contenido. El sitio puede estar bloqueando.")
         return
-    await state.update_data(scraped_text=f"{live_header}\n{scraped_text}", last_url=url, minute_live=minute_live, score_live=score_live)
-    await status_msg.edit_text(f"📊 Estadísticas leídas. {live_header}. Analizando con lupa alineaciones y bajas...")
+    await state.update_data(scraped_text=scraped_text, last_url=url, minute_live=minute_live, score_live=score_live)
+    await status_msg.edit_text(f"📊 Datos listos. Analizando con lupa alineaciones y bajas...")
     try:
         model = genai.GenerativeModel(model_name="gemini-1.5-flash", system_instruction=SYSTEM_INSTRUCTION)
-        prompt = f"{live_header}\nDatos extraídos de Flashscore/FotMob (H2H, alineaciones probables, bajas de jugadores clave, árbitro, tendencias) - Partido: {url}\n\n{scraped_text}\n\n{live_header} - Gemini, usa este minuto/marcador para decidir: si >75' o marcador abultado, prohíbe mercados obsoletos."
+        prompt = f"Datos extraídos (Flashscore/FotMob) - Partido: {url}\n\n{scraped_text}\n\nUsa el Estado/Minuto/Marcador del texto para decidir: si >75' o marcador abultado, prohíbe mercados obsoletos."
         response = await asyncio.to_thread(model.generate_content, prompt)
         analysis_result = response.text.strip() if hasattr(response, "text") and response.text else str(response)
         increment_user_usage(telegram_id)
