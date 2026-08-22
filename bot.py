@@ -566,38 +566,98 @@ async def cmd_hoy(message: Message, state: FSMContext):
                 await page.wait_for_selector("body", timeout=10000)
             except Exception:
                 pass
-            # Extraer enlaces de partidos en vivo
+            # Extraer enlaces distinguiendo EN VIVO vs PROGRAMADO
             try:
                 partidos = await page.evaluate("""() => {
                     const anchors = Array.from(document.querySelectorAll('a[href*="/partido/"], a[href*="/match/"]'));
                     const seen = new Set();
-                    const result = [];
+                    const raw = [];
                     for (const a of anchors) {
                         let href = a.href;
                         if (!href || seen.has(href)) continue;
                         if (!href.includes('/partido/') && !href.includes('/match/')) continue;
                         seen.add(href);
-                        let text = a.innerText.trim() || a.textContent.trim();
-                        if (!text || text.length < 3) {
-                            text = a.getAttribute('aria-label') || href.split('/').filter(Boolean).pop() || 'Partido';
+                        // Contenedor más cercano con info de tiempo/marcador
+                        let container = a.closest('[id^="g_1"], .event__match, .event__game, li, article, .sportName');
+                        if (!container) container = a.parentElement?.parentElement || a.parentElement || a;
+                        let containerText = container ? container.innerText : a.innerText;
+                        containerText = containerText.replace(/\\s+/g, ' ').trim();
+
+                        // Minuto en vivo: 62' , 45+2'
+                        let minuteMatch = containerText.match(/(\\d{1,3}(?:\\+\\d+)?')/);
+                        let minute = minuteMatch ? minuteMatch[1] : null;
+
+                        // Marcador: 0 - 3 , 2:1
+                        let scoreMatch = containerText.match(/(\\d+\\s*[-:]\\s*\\d+)/);
+                        let score = scoreMatch ? scoreMatch[1].replace(/\\s+/g,'').replace(':','-') : null;
+
+                        // Hora programada: 15:00
+                        let timeMatch = containerText.match(/\\b(\\d{1,2}:\\d{2})\\b/);
+                        let time = timeMatch ? timeMatch[1] : null;
+
+                        // Equipos
+                        let teams = a.innerText.trim() || a.textContent.trim();
+                        if (!teams || teams.length < 3) {
+                            const parts = container ? Array.from(container.querySelectorAll('.event__participant, .participant, [class*="participant"]')).map(e=>e.innerText.trim()).filter(Boolean) : [];
+                            if (parts.length >= 2) teams = parts.slice(0,2).join(' vs ');
+                            else {
+                                teams = containerText.replace(minute||'','').replace(score||'','').replace(time||'','').replace(/EN VIVO|LIVE/i,'').trim().substring(0,40);
+                                if (!teams) teams = href.split('/').filter(Boolean).pop() || 'Partido';
+                            }
                         }
-                        text = text.replace(/\\s+/g, ' ').trim();
-                        if (text.length > 40) text = text.substring(0, 40) + '…';
-                        result.push({href, text});
-                        if (result.length >= 12) break;
+                        teams = teams.replace(/\\s+/g,' ').trim();
+                        if (teams.length > 32) teams = teams.substring(0,32) + '…';
+                        if (teams.length < 3) continue;
+
+                        let isLive = !!minute || /en vivo|live|en juego/i.test(containerText);
+                        if (score && minute) isLive = true;
+
+                        let display = "";
+                        if (isLive && minute && score) {
+                            display = `${minute} [${score}] ${teams}`;
+                        } else if (isLive && score) {
+                            display = `EN VIVO [${score}] ${teams}`;
+                        } else if (isLive && minute) {
+                            display = `${minute} ${teams}`;
+                        } else if (time) {
+                            display = `${time} - ${teams}`;
+                        } else {
+                            display = teams;
+                        }
+
+                        // Clave de orden: en vivo primero, luego por hora asc
+                        let sortKey = 9999;
+                        if (isLive) {
+                            let m = parseInt(minute) || 0;
+                            sortKey = -1000 + (100 - m); // minuto alto primero
+                        } else if (time) {
+                            let [h,mi] = time.split(':').map(Number);
+                            sortKey = h*60 + mi;
+                        }
+
+                        // Prioridad atractivo: con goles > sin goles
+                        let attractive = 0;
+                        if (isLive && score && score !== '0-0') attractive = 1;
+
+                        raw.push({href, text: display, isLive, time, score, minute, sortKey, attractive});
+                        if (raw.length >= 18) break;
                     }
-                    // Fallback: busca por contenedores de eventos si no hay anchors
-                    if (result.length === 0) {
-                        const divs = Array.from(document.querySelectorAll('[id^="g_"] a, .event__match a'));
-                        for (const a of divs) {
-                            let href = a.href;
-                            if (!href || seen.has(href)) continue;
-                            seen.add(href);
-                            let text = a.innerText.trim();
-                            if (text.length < 3) continue;
-                            result.push({href, text: text.substring(0,40)});
-                            if (result.length >= 12) break;
+                    // Ordenar: en vivo primero, atractivos primero, luego cronológico
+                    raw.sort((a,b) => {
+                        if (a.isLive && !b.isLive) return -1;
+                        if (!a.isLive && b.isLive) return 1;
+                        if (a.isLive && b.isLive) {
+                            if (a.attractive !== b.attractive) return b.attractive - a.attractive;
+                            return a.sortKey - b.sortKey;
                         }
+                        // ambos programados
+                        return a.sortKey - b.sortKey;
+                    });
+                    const result = raw.slice(0,12).map(({href,text,isLive})=>({href,text,isLive}));
+                    // Fallback si no hay nada
+                    if (result.length === 0 && raw.length === 0) {
+                        const fallback = Array.from(document.querySelectorAll('[id^="g_1"] a')).slice(0,8).map(a=>({href:a.href, text: a.innerText.trim().substring(0,35) || 'Partido', isLive:false})).filter(x=>x.href);
+                        return fallback;
                     }
                     return result;
                 }""")
@@ -609,19 +669,28 @@ async def cmd_hoy(message: Message, state: FSMContext):
         await status_msg.edit_text("❌ Error al conectar con Flashscore en vivo. Intenta de nuevo en unos segundos, mi hermano.")
         return
     if not partidos:
-        await status_msg.edit_text("⚠️ No encontré partidos en vivo en este momento, parcero. Puede que no haya juegos ahora o Flashscore bloqueó la lectura. Prueba enviando un enlace directo de Flashscore o intenta /hoy en unos minutos.", reply_markup=kb_proactivo())
+        await status_msg.edit_text("⚠️ No encontré partidos en vivo ni programados en este momento, parcero. Puede que no haya juegos ahora o Flashscore bloqueó la lectura. Prueba enviando un enlace directo o intenta /hoy en 5 min.", reply_markup=kb_proactivo())
         return
     # Guardar en FSM para callbacks
     await state.update_data(partidos_hoy=partidos)
     await status_msg.delete()
+    # Contadores para mensaje inteligente
+    cnt_vivo = sum(1 for p in partidos if p.get('isLive'))
+    cnt_prog = len(partidos) - cnt_vivo
     kb = InlineKeyboardMarkup(inline_keyboard=[])
     for idx, partido in enumerate(partidos):
-        btn_text = partido['text'][:35] if len(partido['text']) <= 35 else partido['text'][:32] + "…"
-        kb.inline_keyboard.append([InlineKeyboardButton(text=f"⚽ {btn_text}", callback_data=f"hoy_{idx}")])
+        # Prefijo visual según estado
+        prefix = "🔴" if partido.get('isLive') else "⏰"
+        btn_text = partido['text']
+        if len(btn_text) > 38:
+            btn_text = btn_text[:35] + "…"
+        kb.inline_keyboard.append([InlineKeyboardButton(text=f"{prefix} {btn_text}", callback_data=f"hoy_{idx}")])
     kb.inline_keyboard.append([InlineKeyboardButton(text="🔄 Actualizar", callback_data="hoy_refresh"), InlineKeyboardButton(text="❌ Cerrar", callback_data="hoy_close")])
+    header = f"🔥 *En vivo: {cnt_vivo} | Programados: {cnt_prog} - Total {len(partidos)}*"
     await message.answer(
-        f"🔥 *Partidos en vivo encontrados ({len(partidos)}), mi hermano!*\n"
-        f"Toca uno y te hago el análisis proactivo de una (alineaciones con lupa + casas BetPlay/Wplay/Codere/Zamba):",
+        f"{header}\n"
+        f"Formato: `62' [0-3] Equipo vs Equipo` = en vivo con minuto y marcador | `15:00 - Equipo vs Equipo` = por empezar\n"
+        f"Toca uno, parcero, y te hago el análisis proactivo con lupa en alineaciones + casa recomendada:",
         parse_mode="Markdown",
         reply_markup=kb
     )
