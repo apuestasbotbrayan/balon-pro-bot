@@ -63,13 +63,13 @@ async def fetch_flashscore_text(url: str) -> tuple[str, str, str]:
         headers = dict(HEADERS_CHROME)
         if HAS_CURL and curl_requests is not None:
             try:
-                resp = curl_requests.get(u, headers=headers, impersonate="chrome110", timeout=15000)
+                resp = curl_requests.get(u, headers=headers, impersonate="chrome110", timeout=15)
                 if resp.status_code == 200 and len(resp.text) > 500:
                     return resp.text
             except Exception:
                 pass
         try:
-            resp = req_requests.get(u, headers=headers, timeout=15000)
+            resp = req_requests.get(u, headers=headers, timeout=15)
             if resp.status_code == 200 and len(resp.text) > 500:
                 return resp.text
         except Exception:
@@ -141,13 +141,13 @@ async def fetch_fotmob_data(url: str) -> tuple[str, str, str]:
         headers["Accept"] = "application/json, text/plain, */*"
         if HAS_CURL and curl_requests is not None:
             try:
-                resp = curl_requests.get(api_url, headers=headers, impersonate="chrome110", timeout=15000)
+                resp = curl_requests.get(api_url, headers=headers, impersonate="chrome110", timeout=15)
                 if resp.status_code == 200:
                     return resp.json()
             except Exception:
                 pass
         try:
-            resp = req_requests.get(api_url, headers=headers, timeout=15000)
+            resp = req_requests.get(api_url, headers=headers, timeout=15)
             if resp.status_code == 200:
                 return resp.json()
         except Exception:
@@ -240,14 +240,14 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "8021280020"))
 
 DB_NAME = "bot_database.db"
 
-# Inicializar cliente OpenAI apuntando a xAI endpoint
+# Cliente OpenAI oficial configurado hacia xAI endpoint
 xai_client = OpenAI(
     api_key=XAI_API_KEY,
     base_url="https://api.x.ai/v1"
 )
-GROK_MODEL = "grok-beta"
+GROK_MODEL = "grok-4.3"
 
-async def grok_generate_with_retry(system_instruction: str, user_prompt: str, max_retries: int = 1):
+async def grok_generate_with_retry(system_instruction: str, user_prompt: str, max_retries: int = 2):
     """Llamada a Grok blindada con reintentos automáticos."""
     for attempt in range(max_retries + 1):
         try:
@@ -258,13 +258,13 @@ async def grok_generate_with_retry(system_instruction: str, user_prompt: str, ma
                     {"role": "system", "content": system_instruction},
                     {"role": "user", "content": user_prompt}
                 ],
-                temperature=0.7
+                temperature=0.7,
+                timeout=30.0
             )
             return response.choices[0].message.content.strip()
         except Exception as e:
-            msg = str(e).lower()
+            logging.warning(f"Grok intento {attempt + 1} fallido por error: {e}")
             if attempt < max_retries:
-                logging.warning(f"Grok reintentando por error: {e}")
                 await asyncio.sleep(2)
                 continue
             raise
@@ -272,10 +272,7 @@ async def grok_generate_with_retry(system_instruction: str, user_prompt: str, ma
 SYSTEM_INSTRUCTION = (
     "Actúa como tipster profesional colombiano parcero experto. Cuando recibas datos de un partido (Flashscore/FotMob), "
     "REVISA CON LUPA las alineaciones probables y bajas de jugadores clave, además de árbitro, H2H y tendencias. "
-    "TE INYECTARÉ OBLIGATORIAMENTE el MINUTO ACTUAL (ej. 85', 90+2') y el MARCADOR EN VIVO (ej. 3-0) si el partido está en juego; si es programado dirá 'No iniciado'. "
-    "SÉ CONSCIENTE DEL MINUTO EXACTO: si minuto >75 o marcador abultado (ej. 3-0, 4-1), PROHIBIDO sugerir mercados pre-partido obsoletos como 'Ambos Anotan' si ya van 3-0, 'Over 2.5' si ya está definido, o 'Gana X' si no queda tiempo. "
-    "En esos casos enfoca SOLO mercados lógicos de cierre en vivo (ej. Under restante, córners finales, posesión, tarjetas por desesperación) o DESCARTA y di claramente 'Parcero, este partido ya va a finalizar, no hay valor, mejor pasamos' si no queda valor. "
-    "Sé ULTRA RESUMIDO y VISUAL, sin floro. "
+    "SÉ ULTRA RESUMIDO y VISUAL, sin floro. "
     "Saluda breve parcero ('¡Epa, mi hermano!') y presenta de una las 2 o 3 mejores Value Bets SIN INVENTAR CUOTAS FIJAS. "
     "PROHIBIDO poner números de cuota falsos (no escribas 'Cuota 1.65' si no te la dieron). "
     "Formato obligatorio, máximo 1 línea por opción: '🔥 [Mercado]: [por qué en máx 15 palabras] | 📍 Busca en [BetPlay/Wplay/Codere/Zamba]'. "
@@ -284,16 +281,14 @@ SYSTEM_INSTRUCTION = (
 
 SYSTEM_INSTRUCTION_CUOTA = (
     "Actúa como tipster colombiano parcero firme y directo. Cuando el usuario te dé una cuota/mercado, "
-    "calcula Probabilidad Implícita (1/Cuota) y EV internamente pero NO muestres fórmula larga. "
+    "calcula Probabilidad Implícita y EV internamente sin mostrar fórmulas largas. "
     "Responde AL GRANO en MÁXIMO 2 LÍNEAS: "
-    "Línea 1: veredicto en una sola frase con emoji: si EV >5% -> '🟢 ¡Métale con confianza! (EV +X%)' "
-    "si no -> '🔴 ¡Pilas, no bote la plata por ahí! (EV -X% / Sin valor)'. "
-    "Línea 2: justificación técnica ultra corta en 1 frase + menciona casa recomendada: '📍 Búscala en [BetPlay/Wplay/Codere/Zamba]'."
+    "Línea 1: veredicto con emoji: si EV >5% -> '🟢 ¡Métale con confianza!' si no -> '🔴 ¡Pilas, no bote la plata por ahí!'. "
+    "Línea 2: justificación corta + casa recomendada: '📍 Búscala en [BetPlay/Wplay/Codere/Zamba]'."
 )
 
 SYSTEM_INSTRUCTION_COMBINADA = (
     "Actúa como tipster profesional colombiano parcero experto en combinadas/parlays. "
-    "Recibes datos de VARIOS partidos de Flashscore/FotMob. Sé ULTRA RESUMIDO y VISUAL, sin floro. "
     "Propón 1 combinada principal de 2-3 selecciones en formato: "
     "'🔥 [Partido - Mercado]: [por qué 10 palabras] | 📍 BetPlay/Wplay/Codere/Zamba'. "
     "Cierra con: '¿Cuál te gusta o qué cuota te ofrece tu casa de apuestas para calcular si le apostamos?'"
@@ -346,7 +341,8 @@ def init_db():
             telegram_id INTEGER PRIMARY KEY,
             enlaces_hoy INTEGER DEFAULT 0,
             fecha_expiracion TEXT,
-            banca_actual REAL DEFAULT 0
+            banca_actual REAL DEFAULT 0,
+            ultimo_uso TEXT
         )
     """)
     cursor.execute("""
@@ -398,8 +394,8 @@ def check_user_access(telegram_id: int):
         conn.commit()
         conn.close()
         enlaces_hoy = 0
-    if enlaces_hoy >= 10:
-        return False, "🚫 Has alcanzado el límite diario de 10 enlaces. Vuelve mañana."
+    if enlaces_hoy >= 15:
+        return False, "🚫 Has alcanzado el límite diario de enlaces. Vuelve mañana."
     return True, ""
 
 def check_user_valid(telegram_id: int):
@@ -468,7 +464,7 @@ def get_historial_text(telegram_id: int) -> str:
     fallidos = fallidos or 0
     pendientes = pendientes or 0
     if total == 0:
-        return "📊 *Historial vacío, parcero.*\nAún no has evaluado cuotas. Envíame un Flashscore y luego mándame tu cuota."
+        return "📊 *Historial vacío, parcero.*\nAún no has evaluado cuotas. Envíame un enlace y luego mándame tu cuota."
     calificados = acertados + fallidos
     efectividad = (acertados / calificados * 100) if calificados > 0 else 0.0
     líneas = []
@@ -477,14 +473,14 @@ def get_historial_text(telegram_id: int) -> str:
         estado_txt = "Pendiente" if estado == "PENDIENTE" else "Acertado" if estado == "ACERTADO" else "Fallido"
         partido_corto = (partido[:45] + "…") if len(partido) > 45 else partido
         cuota_txt = f"{cuota:.2f}" if cuota else "—"
-        líneas.append(f"{emoji} `#{_id}` {partido_corto}\n   {mercado} @ {cuota_txt} — {estado_txt} ({fecha})")
+        líneas.append(f"{emoji} `#{_id}` {partido_corto}\n   {mercado} @ {cuota_txt} — {estado_txt}")
     historial_txt = "\n\n".join(líneas)
     return (
         f"📊 *Tu Historial (últimas 5)*\n\n"
         f"{historial_txt}\n\n"
         f"━━━━━━━━━━━━━━━\n"
         f"📈 *Efectividad:* {efectividad:.1f}% ({acertados}✅/{calificados} calificadas)\n"
-        f"📦 Total: {total} | ⏳ Pendientes: {pendientes} | 🔴 Fallidas: {fallidos}"
+        f"📦 Total: {total} | ⏳ Pendientes: {pendientes}"
     )
 
 def get_banca_text(telegram_id: int) -> str:
@@ -493,9 +489,9 @@ def get_banca_text(telegram_id: int) -> str:
         return (
             f"💰 Tu banca actual: {format_pesos(banca)}\n"
             f"Stake 2% = {format_pesos(banca*0.02)} | 3% = {format_pesos(banca*0.03)}\n\n"
-            f"Para actualizar: `/banca 200000`"
+            f"Para actualizar: `/banca 105537`"
         )
-    return "💰 No has configurado banca, parcero.\nUsa `/banca 200000` para que te calcule el stake automático."
+    return "💰 No has configurado banca, parcero.\nUsa `/banca 105537` para calcular tu stake automático."
 
 # ==========================================
 # 4. MÁQUINA DE ESTADOS (FSM)
@@ -504,7 +500,6 @@ class AnalysisStates(StatesGroup):
     waiting_for_license = State()
     waiting_for_link = State()
     waiting_for_quota_or_chat = State()
-    waiting_for_quota = State()
     collecting_combinada = State()
 
 router = Router()
@@ -529,7 +524,7 @@ async def activate_license(message: Message, codigo: str, state: FSMContext):
     today_str = datetime.now().strftime("%Y-%m-%d")
     cursor.execute("""
         INSERT OR REPLACE INTO usuarios (telegram_id, enlaces_hoy, fecha_expiracion, ultimo_uso, banca_actual)
-        VALUES (?, 0, ?, ?, 0)
+        VALUES (?, 0, ?, ?, 105537)
     """, (telegram_id, fecha_exp, today_str))
     conn.commit()
     conn.close()
@@ -537,7 +532,7 @@ async def activate_license(message: Message, codigo: str, state: FSMContext):
     await message.answer(
         f"✅ ¡Licencia activada, mi hermano!\n"
         f"📅 Válida por {dias_duracion} días hasta {fecha_exp}.\n\n"
-        f"📎 Pilas pues, envíame un enlace de Flashscore y te saco de una las mejores opciones de valor."
+        f"📎 Pilas pues, envíame un enlace de Flashscore o FotMob y te saco de una las mejores opciones de valor."
     )
 
 # ==========================================
@@ -557,7 +552,7 @@ async def cmd_start(message: Message, state: FSMContext):
             exp_date = datetime.strptime(row[0], "%Y-%m-%d")
             if datetime.now().date() <= exp_date.date():
                 await state.set_state(AnalysisStates.waiting_for_link)
-                await message.answer("✅ Licencia activa, parcero. Envíame tu enlace de Flashscore y lo analizamos de una.", reply_markup=kb_proactivo())
+                await message.answer("✅ Licencia activa, parcero. Envíame tu enlace y lo analizamos de una.", reply_markup=kb_proactivo())
                 return
         except Exception:
             pass
@@ -608,24 +603,6 @@ async def cmd_banca(message: Message):
     except ValueError:
         await message.answer("❌ Monto inválido. Ej: `/banca 105537`")
 
-@router.message(Command("generar"))
-async def cmd_generar(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("⛔ No tienes permisos.")
-        return
-    args = message.text.split(maxsplit=1)
-    if len(args) < 2 or not args[1].isdigit():
-        await message.answer("⚠️ Uso: `/generar <dias>`")
-        return
-    dias = int(args[1])
-    codigo = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("INSERT INTO licencias (codigo, dias_duracion, usado) VALUES (?, ?, 0)", (codigo, dias))
-    conn.commit()
-    conn.close()
-    await message.answer(f"🔑 Licencia generada:\n• Código: `{codigo}`\n• Duración: {dias} días")
-
 @router.message(Command("historial"))
 async def cmd_historial(message: Message):
     telegram_id = message.from_user.id
@@ -650,38 +627,6 @@ async def cmd_combinada(message: Message, state: FSMContext):
 async def cmd_cancelar_combinada(message: Message, state: FSMContext):
     await state.set_state(AnalysisStates.waiting_for_link)
     await message.answer("✅ Modo normal activado.", reply_markup=kb_proactivo())
-
-@router.message(Command("calcular_combinada"))
-async def cmd_calcular_combinada(message: Message, state: FSMContext):
-    await procesar_combinada(message, state)
-
-async def ejecutar_analisis_proactivo(url: str, message: Message, state: FSMContext):
-    telegram_id = message.from_user.id
-    allowed, err_msg = check_user_access(telegram_id)
-    if not allowed:
-        await message.answer(err_msg, reply_markup=kb_proactivo())
-        return
-    status_msg = await message.answer("🔍 Enlace seleccionado. Extrayendo datos...")
-    try:
-        scraped_text, minute_live, score_live = await fetch_match_data(url)
-        if not scraped_text or len(scraped_text.strip()) < 150:
-            await status_msg.edit_text("❌ No se pudo leer el partido, intenta de nuevo.")
-            return
-    except Exception:
-        await status_msg.edit_text("❌ Error al extraer datos del partido.")
-        return
-    await state.update_data(scraped_text=scraped_text, last_url=url)
-    await status_msg.edit_text("📊 Analizando con Grok (xAI)...")
-    try:
-        prompt = f"Datos extraídos - Partido: {url}\n\n{scraped_text}"
-        analysis_result = await grok_generate_with_retry(SYSTEM_INSTRUCTION, prompt)
-        increment_user_usage(telegram_id)
-        await message.answer(analysis_result, reply_markup=kb_proactivo())
-        await state.set_state(AnalysisStates.waiting_for_quota_or_chat)
-        await status_msg.delete()
-    except Exception as e:
-        logging.error(f'Grok API Error: {e}')
-        await status_msg.edit_text("❌ Error al conectar con Grok. Intenta de nuevo, parcero.")
 
 async def procesar_combinada(message: Message, state: FSMContext):
     telegram_id = message.from_user.id
@@ -712,7 +657,7 @@ async def procesar_combinada(message: Message, state: FSMContext):
         await status_msg.delete()
     except Exception as e:
         logging.error(f'Grok API Error: {e}')
-        await status_msg.edit_text("❌ Error al calcular la combinada.")
+        await status_msg.edit_text("❌ Error al calcular la combinada con Grok.")
 
 @router.callback_query(F.data == "ver_historial")
 async def cb_ver_historial(callback: CallbackQuery):
@@ -767,7 +712,7 @@ async def handle_user_flow(message: Message, state: FSMContext):
             return
         return
 
-    if current_state in (AnalysisStates.waiting_for_quota_or_chat.state, AnalysisStates.waiting_for_quota.state):
+    if current_state == AnalysisStates.waiting_for_quota_or_chat.state:
         if text_lower.startswith("combinada"):
             await cmd_combinada(message, state)
             return
@@ -782,14 +727,14 @@ async def handle_user_flow(message: Message, state: FSMContext):
         await message.answer("⚠️ Envía un enlace válido de Flashscore o FotMob.", reply_markup=kb_proactivo())
         return
     
-    status_msg = await message.answer("🔍 Enlace válido. Extrayendo...", reply_markup=kb_proactivo())
+    status_msg = await message.answer("🔍 Enlace válido. Extrayendo datos...", reply_markup=kb_proactivo())
     try:
         scraped_text, minute_live, score_live = await fetch_match_data(text)
         if not scraped_text or len(scraped_text.strip()) < 150:
             await status_msg.edit_text("❌ No se pudo leer el partido, intenta de nuevo.")
             return
     except Exception:
-        await status_msg.edit_text("❌ Error al extraer datos.")
+        await status_msg.edit_text("❌ Error al extraer datos del partido.")
         return
 
     await state.update_data(scraped_text=scraped_text, last_url=text)
@@ -800,10 +745,10 @@ async def handle_user_flow(message: Message, state: FSMContext):
         increment_user_usage(telegram_id)
         await message.answer(analysis_result, reply_markup=kb_proactivo())
         await state.set_state(AnalysisStates.waiting_for_quota_or_chat)
+        await status_msg.delete()
     except Exception as e:
         logging.error(f'Grok API Error: {e}')
-        await message.answer("❌ Error al conectar con Grok.", reply_markup=kb_proactivo())
-        await state.set_state(AnalysisStates.waiting_for_quota_or_chat)
+        await status_msg.edit_text("❌ Error al conectar con Grok. Intenta de nuevo, parcero.")
 
 async def process_quota_chat(message: Message, state: FSMContext):
     telegram_id = message.from_user.id
@@ -846,8 +791,8 @@ async def process_quota_chat(message: Message, state: FSMContext):
         await message.answer("¿Qué hacemos ahora, parcero?", reply_markup=kb_cuota())
         await state.set_state(AnalysisStates.waiting_for_quota_or_chat)
     except Exception as e:
-        logging.error(f'Grok API Error: {e}')
-        await processing_msg.edit_text("❌ Error al evaluar la cuota.")
+        logging.error(f'Grok API Error al evaluar cuota: {e}')
+        await processing_msg.edit_text("❌ Error al evaluar la cuota con Grok.")
 
 # ==========================================
 # 6. MAIN & FLASK
