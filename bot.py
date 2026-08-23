@@ -380,7 +380,6 @@ def init_db():
     except sqlite3.OperationalError:
         pass
 
-    # Tabla para almacenar códigos de activación (Pines)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS codigos (
             codigo TEXT PRIMARY KEY,
@@ -516,18 +515,22 @@ def get_historial_text(telegram_id: int) -> str:
         FROM historial_apuestas WHERE telegram_id = ? ORDER BY id DESC LIMIT 5
     """, (telegram_id,))
     rows = cursor.fetchall()
+    
     cursor.execute("""
         SELECT COUNT(*), SUM(CASE WHEN estado='ACERTADO' THEN 1 ELSE 0 END), SUM(CASE WHEN estado='FALLIDO' THEN 1 ELSE 0 END), SUM(CASE WHEN estado='PENDIENTE' THEN 1 ELSE 0 END)
         FROM historial_apuestas WHERE telegram_id = ?
     """, (telegram_id,))
-    total, acertados, fallidos, pendientes = cursor.fetchone()
+    resumen = cursor.fetchone()
     conn.close()
-    total = total or 0
-    acertados = acertados or 0
-    fallidos = fallidos or 0
-    pendientes = pendientes or 0
+    
+    total = resumen[0] if resumen and resumen[0] is not None else 0
+    acertados = resumen[1] if resumen and resumen[1] is not None else 0
+    fallidos = resumen[2] if resumen and resumen[2] is not None else 0
+    pendientes = resumen[3] if resumen and resumen[3] is not None else 0
+
     if total == 0:
-        return "📊 *Historial vacío, parcero.*\nAún no has evaluado cuotas."
+        return f"📊 *Historial vacío, parcero.*\nAún no has evaluado cuotas."
+        
     calificados = acertados + fallidos
     efectividad = (acertados / calificados * 100) if calificados > 0 else 0.0
     líneas = []
@@ -537,6 +540,7 @@ def get_historial_text(telegram_id: int) -> str:
         partido_corto = (partido[:40] + "…") if len(partido) > 40 else partido
         cuota_txt = f"{cuota:.2f}" if cuota else "—"
         líneas.append(f"{emoji} `#{_id}` {partido_corto}\n   {mercado} @ {cuota_txt} — {estado_txt}")
+    
     historial_txt = "\n\n".join(líneas)
     return (
         f"📊 *Tu Historial (últimas 5)*\n\n"
@@ -592,7 +596,6 @@ async def cmd_start(message: Message, state: FSMContext):
         reply_markup=kb_proactivo()
     )
 
-# Comando de Admin para generar códigos cortos listos para copiar y pegar: /generar 1m (o 7d, 1a)
 @router.message(Command("generar"))
 async def cmd_generar(message: Message):
     if message.from_user.id != ADMIN_ID:
@@ -600,7 +603,6 @@ async def cmd_generar(message: Message):
     args = message.text.split()
     duracion = args[1].strip() if len(args) > 1 else "1m"
     
-    # Generar un código corto tipo BP-XXXX (4 caracteres aleatorios en mayúsculas y números)
     sufijo = ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
     codigo = f"BP-{sufijo}"
     fecha_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -623,7 +625,6 @@ async def cmd_generar(message: Message):
     )
     await message.answer(texto_copiar, parse_mode="Markdown")
 
-# Comando para que el cliente canjee su código
 @router.message(Command("canje"))
 async def cmd_canje(message: Message):
     args = message.text.split()
@@ -650,12 +651,10 @@ async def cmd_canje(message: Message):
         await message.answer("⚠️ *Este código ya fue utilizado.* Los códigos son de un solo uso.", parse_mode="Markdown")
         return
 
-    # Marcar código como usado
     cursor.execute("UPDATE codigos SET usado = 1 WHERE codigo = ?", (codigo_ingresado,))
     conn.commit()
     conn.close()
 
-    # Activar la suscripción al usuario
     exp_str = activar_usuario_tiempo_str(telegram_id, duracion)
 
     await message.answer(
