@@ -14,7 +14,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, Update
 
 # Cliente oficial moderno de Google GenAI
 from google import genai
@@ -237,10 +237,10 @@ async def fetch_match_data(url: str) -> tuple[str, str, str]:
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8785828541:AAHuZoLPpmwDYXzXl92b_PxMDxJ3jpY0Q6g")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "8021280020"))
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://balon-pro-bot.onrender.com")
 
 DB_NAME = "bot_database.db"
 
-# Inicialización con el nuevo SDK oficial de Google
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 GEMINI_MODEL_ID = "gemini-2.5-flash"
 
@@ -787,34 +787,36 @@ async def process_quota_chat(message: Message, state: FSMContext):
         await processing_msg.edit_text("❌ Error al evaluar la cuota con Gemini.")
 
 # ==========================================
-# 6. MAIN & FLASK
+# 6. WEBHOOKS & FLASK (Solución Definitiva)
 # ==========================================
-import threading
-from flask import Flask
+from flask import Flask, request
 
 web_app = Flask(__name__)
+bot = Bot(token=TELEGRAM_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
+dp.include_router(router)
 
 @web_app.route('/')
 def home():
-    return '¡El Bot de Apuestas con Gemini está activo 24/7, mi hermano! 🚀⚽'
+    return '¡El Bot de Apuestas con Webhook y Gemini está activo 24/7, mi hermano! 🚀⚽'
 
-def run_web():
-    port = int(os.getenv('PORT', 10000))
-    web_app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+@web_app.route(f"/webhook/{TELEGRAM_TOKEN}", methods=["POST"])
+def telegram_webhook():
+    if request.headers.get("content-type") == "application/json":
+        json_string = request.get_data().decode("utf-8")
+        update = Update.model_validate(json.loads(json_string), context={"bot": bot})
+        asyncio.run(dp.feed_update(bot, update))
+        return "", 200
+    return "Invalid request", 403
 
-async def main():
-    init_db()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-    bot = Bot(token=TELEGRAM_TOKEN)
-    dp = Dispatcher(storage=MemoryStorage())
-    dp.include_router(router)
-    logging.info("Bot iniciado correctamente con Google GenAI (aiogram v3.x)")
-    await dp.start_polling(bot)
+def setup_webhook():
+    url = f"{WEBHOOK_URL.rstrip('/')}/webhook/{TELEGRAM_TOKEN}"
+    requests_sync = req_requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook?url={url}")
+    logging.info(f"Configurando Webhook en Telegram: {requests_sync.text}")
 
 if __name__ == '__main__':
-    web_thread = threading.Thread(target=run_web, daemon=True)
-    web_thread.start()
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logging.info('Bot detenido.')
+    init_db()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    setup_webhook()
+    port = int(os.getenv('PORT', 10000))
+    web_app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
