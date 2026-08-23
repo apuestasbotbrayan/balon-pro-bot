@@ -23,6 +23,10 @@ from google import genai
 from playwright.async_api import async_playwright
 from playwright_stealth import stealth_async
 
+# Importaciones para Google Sheets
+import gspread
+from google.oauth2.service_account import Credentials
+
 try:
     from curl_cffi import requests as curl_requests
     HAS_CURL = True
@@ -204,7 +208,7 @@ async def fetch_fotmob_data(url: str) -> tuple[str, str, str]:
                 f"Partido: {teams_txt}",
                 f"Liga: {league}",
                 f"Estado: {estado_txt} | Minuto actual: {minute} | Marcador: {score}",
-                f"Contexto temporal: {'Partido pre-partido' if estado_txt == 'Pre-partido' else f'ATENCIÓN EN VIVO: El partido va por el MINUTO {minute} con marcador {score}. Adapta los mercados de riesgo de forma estricta al tiempo restante (ej: si está en el minuto 85+, enfócate en córneres desesperados, goles agónicos o tarjetas por tensión).'}"
+                f"Contexto temporal: {'Partido pre-partido' if estado_txt == 'Pre-partido' else f'ATENCIÓN EN VIVO: Minuto {minute} con marcador {score}. Adapta los mercados de riesgo.'}"
             ]
 
             match_facts = content.get("matchFacts") or {}
@@ -234,7 +238,7 @@ async def fetch_match_data(url: str) -> tuple[str, str, str]:
     return await fetch_flashscore_text(url)
 
 # ==========================================
-# 1. ROTACIÓN INTELIGENTE DE API KEYS
+# 1. CONFIGURACIÓN E INTELIGENCIA ARTIFICIAL
 # ==========================================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8785828541:AAHuZoLPpmwDYXzXl92b_PxMDxJ3jpY0Q6g")
 RAW_KEYS = os.getenv("GEMINI_API_KEY", "")
@@ -267,11 +271,10 @@ async def gemini_generate_with_retry(system_instruction: str, user_prompt: str, 
             return response.text.strip()
         except Exception as e:
             err_str = str(e)
-            logging.warning(f"Intento {attempt + 1} con clave actual falló: {err_str}")
-            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                if attempt < max_retries:
-                    await asyncio.sleep(1)
-                    continue
+            logging.warning(f"Intento {attempt + 1} falló: {err_str}")
+            if ("429" in err_str or "RESOURCE_EXHAUSTED" in err_str) and attempt < max_retries:
+                await asyncio.sleep(1)
+                continue
             if attempt < max_retries:
                 await asyncio.sleep(2)
                 continue
@@ -280,7 +283,7 @@ async def gemini_generate_with_retry(system_instruction: str, user_prompt: str, 
 SYSTEM_INSTRUCTION = (
     "Actúa como tipster profesional colombiano parcero experto. "
     "MUY IMPORTANTE: Analiza con lupa el MINUTO ACTUAL y el MARCADOR del partido en los datos. "
-    "Si el partido está avanzado (ej: minuto 75+), tus Value Bets deben ser de ALTO RIESGO EN VIVO (próximo gol, córneres desesperados, tarjetas por fricción). "
+    "Si el partido está avanzado (ej: minuto 75+), tus Value Bets deben ser de ALTO RIESGO EN VIVO. "
     "SÉ ULTRA RESUMIDO y VISUAL, sin floro. "
     "Saluda breve parcero ('¡Epa, mi hermano!') y presenta de una 3 Value Bets SÓLIDAS Y ACORDES AL TIEMPO ACTUAL. "
     "PROHIBIDO poner números de cuota falsos. "
@@ -307,6 +310,13 @@ def kb_proactivo() -> InlineKeyboardMarkup:
         ]
     ])
 
+def kb_pago_requerido() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="💬 Escríbeme al WhatsApp", url="https://wa.me/573216880439?text=Hola,%20quiero%20activar%20mi%20cuenta%20VIP%20de%20Balon%20Pro%20por%20$10.000")
+        ]
+    ])
+
 def kb_cuota() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -327,15 +337,43 @@ def kb_calificar_apuesta(apuesta_id: int) -> InlineKeyboardMarkup:
     ])
 
 # ==========================================
-# 3. CAPA DE DATOS (SQLite & Descuento de Banca)
+# 3. CAPA DE DATOS (SQLite & Google Sheets)
 # ==========================================
+SCOPES = ["https://www.spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+
+def registrar_en_google_sheets(telegram_id: int, banca: float, estado: str):
+    try:
+        if not os.path.exists("credentials.json"):
+            return
+        creds = Credentials.from_service_account_file("credentials.json", scopes=SCOPES)
+        client = gspread.authorize(creds)
+        sheet = client.open("BalonPro_Registros").sheet1
+        
+        # Intentar buscar si ya existe el usuario por su Telegram ID
+        try:
+            cell = sheet.find(str(telegram_id))
+            if cell:
+                sheet.update_cell(cell.row, 2, banca)
+                sheet.update_cell(cell.row, 3, estado)
+                sheet.update_cell(cell.row, 4, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                return
+        except Exception:
+            pass
+        
+        # Si no existe, agrega nueva fila: [Telegram ID, Banca, Estado (Activo/Inactivo), Fecha]
+        sheet.append_row([str(telegram_id), banca, estado, datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
+    except Exception as e:
+        logging.error(f"Error sincronizando con Google Sheets: {e}")
+
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS usuarios (
             telegram_id INTEGER PRIMARY KEY,
-            banca_actual REAL DEFAULT 0
+            banca_actual REAL DEFAULT 0,
+            activo INTEGER DEFAULT 0,
+            fecha_registro TEXT
         )
     """)
     cursor.execute("""
@@ -350,16 +388,41 @@ def init_db():
             fecha TEXT
         )
     """)
-    try:
-        cursor.execute("ALTER TABLE usuarios ADD COLUMN banca_actual REAL DEFAULT 0")
-    except sqlite3.OperationalError:
-        pass
-    try:
-        cursor.execute("ALTER TABLE historial_apuestas ADD COLUMN stake REAL DEFAULT 0")
-    except sqlite3.OperationalError:
-        pass
     conn.commit()
     conn.close()
+
+def registrar_o_verificar_usuario(telegram_id: int) -> int:
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT activo, banca_actual FROM usuarios WHERE telegram_id = ?", (telegram_id,))
+    row = cursor.fetchone()
+    
+    if row is None:
+        fecha_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cursor.execute("INSERT INTO usuarios (telegram_id, banca_actual, activo, fecha_registro) VALUES (?, 0, 0, ?)", (telegram_id, fecha_now))
+        conn.commit()
+        activo = 0
+        banca = 0.0
+    else:
+        activo, banca = row[0], row[1]
+    conn.close()
+    
+    # Sincronizar con Google Sheets en segundo plano
+    estado_str = "ACTIVO" if activo == 1 else "INACTIVO"
+    threading.Thread(target=registrar_en_google_sheets, args=(telegram_id, banca, estado_str), daemon=True).start()
+    return activo
+
+def activar_usuario_db(telegram_id: int):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE usuarios SET activo = 1 WHERE telegram_id = ?", (telegram_id,))
+    conn.commit()
+    cursor.execute("SELECT banca_actual FROM usuarios WHERE telegram_id = ?", (telegram_id,))
+    row = cursor.fetchone()
+    banca = row[0] if row else 0.0
+    conn.close()
+    
+    threading.Thread(target=registrar_en_google_sheets, args=(telegram_id, banca, "ACTIVO"), daemon=True).start()
 
 def get_banca(telegram_id: int) -> float:
     conn = sqlite3.connect(DB_NAME)
@@ -377,9 +440,14 @@ def get_banca(telegram_id: int) -> float:
 def set_banca(telegram_id: int, monto: float):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("INSERT OR REPLACE INTO usuarios (telegram_id, banca_actual) VALUES (?, ?)", (telegram_id, monto))
+    cursor.execute("UPDATE usuarios SET banca_actual = ? WHERE telegram_id = ?", (monto, telegram_id))
     conn.commit()
     conn.close()
+    
+    # Actualizar también en Google Sheets
+    activo = registrar_o_verificar_usuario(telegram_id)
+    estado_str = "ACTIVO" if activo == 1 else "INACTIVO"
+    threading.Thread(target=registrar_en_google_sheets, args=(telegram_id, monto, estado_str), daemon=True).start()
 
 def descontar_banca(telegram_id: int, monto_stake: float):
     banca_actual = get_banca(telegram_id)
@@ -416,7 +484,7 @@ def get_historial_text(telegram_id: int) -> str:
     fallidos = fallidos or 0
     pendientes = pendientes or 0
     if total == 0:
-        return "📊 *Historial vacío, parcero.*\nAún no has evaluado cuotas. Envíame un enlace y luego mándame tu cuota."
+        return "📊 *Historial vacío, parcero.*\nAún no has evaluado cuotas."
     calificados = acertados + fallidos
     efectividad = (acertados / calificados * 100) if calificados > 0 else 0.0
     líneas = []
@@ -441,9 +509,9 @@ def get_banca_text(telegram_id: int) -> str:
         return (
             f"💰 Tu banca actual: {format_pesos(banca)}\n"
             f"Stake 2% = {format_pesos(banca*0.02)} | 3% = {format_pesos(banca*0.03)}\n\n"
-            f"Para actualizar: `/banca 105537`"
+            f"Para actualizar: `/banca 100000`"
         )
-    return "💰 No has configurado banca, parcero.\nUsa `/banca 105537` para calcular tu stake automático."
+    return "💰 No has configurado banca, parcero.\nUsa `/banca 100000` para calcular tu stake automático."
 
 # ==========================================
 # 4. MÁQUINA DE ESTADOS (FSM)
@@ -459,17 +527,57 @@ router = Router()
 # ==========================================
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
+    telegram_id = message.from_user.id
+    activo = registrar_o_verificar_usuario(telegram_id)
+
+    if activo == 0 and telegram_id != ADMIN_ID:
+        await message.answer(
+            "🛑 *¡Acceso Restringido, mi hermano!*\n\n"
+            "El acceso mensual a **Balon Pro AI** cuesta solo **$ 10.000 COP**.\n\n"
+            "💬 Escríbeme al WhatsApp **3216880439** para reportar tu pago y habilitar tu cuenta al instante.",
+            parse_mode="Markdown",
+            reply_markup=kb_pago_requerido()
+        )
+        return
+
     await state.set_state(AnalysisStates.waiting_for_link)
     await message.answer(
         "👋 *¡Bienvenido al Tipster Bot Pro, mi hermano!*\n\n"
-        "📎 Envíame un enlace de Flashscore o FotMob de cualquier partido, o una foto de tu apuesta, y te entrego las mejores Value Bets al instante.",
+        "📎 Envíame un enlace de Flashscore o FotMob (Pre-partido o En Vivo), o una foto de tu apuesta, y te entrego las mejores Value Bets al instante.",
         parse_mode="Markdown",
         reply_markup=kb_proactivo()
     )
 
+# Comando de Administrador para activar clientes: /activar [telegram_id]
+@router.message(Command("activar"))
+async def cmd_activar(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer("❌ Usa: `/activar [telegram_id]`")
+        return
+    try:
+        target_id = int(args[1].strip())
+        activar_usuario_db(target_id)
+        await message.answer(f"✅ ¡Usuario `{target_id}` activado con éxito y sincronizado en Google Sheets!")
+        try:
+            await bot.send_message(
+                target_id,
+                "🎉 *¡Tu suscripción ha sido activada con éxito!*\n\n"
+                "Ya puedes usar todas las funciones del bot enviando `/start` o mandando el enlace de cualquier partido. ¡A facturar, parcero! 🚀⚽",
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+    except ValueError:
+        await message.answer("❌ ID de Telegram inválido.")
+
 @router.message(Command("banca"))
 async def cmd_banca(message: Message):
     telegram_id = message.from_user.id
+    if registrar_o_verificar_usuario(telegram_id) == 0 and telegram_id != ADMIN_ID:
+        return
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
         await message.answer(get_banca_text(telegram_id), parse_mode="Markdown")
@@ -486,11 +594,14 @@ async def cmd_banca(message: Message):
             reply_markup=kb_proactivo()
         )
     except ValueError:
-        await message.answer("❌ Monto inválido. Ej: `/banca 105537`")
+        await message.answer("❌ Monto inválido. Ej: `/banca 100000`")
 
 @router.message(Command("historial"))
 async def cmd_historial(message: Message):
-    await message.answer(get_historial_text(message.from_user.id), parse_mode="Markdown")
+    telegram_id = message.from_user.id
+    if registrar_o_verificar_usuario(telegram_id) == 0 and telegram_id != ADMIN_ID:
+        return
+    await message.answer(get_historial_text(telegram_id), parse_mode="Markdown")
 
 @router.callback_query(F.data == "ver_historial")
 async def cb_ver_historial(callback: CallbackQuery):
@@ -518,9 +629,11 @@ async def cb_calificar(callback: CallbackQuery):
     else:
         await callback.answer("Acción no válida.")
 
-# Manejador de FOTOS (Lectura de imágenes / tiquetes)
 @router.message(F.photo)
 async def handle_photo_flow(message: Message, state: FSMContext):
+    telegram_id = message.from_user.id
+    if registrar_o_verificar_usuario(telegram_id) == 0 and telegram_id != ADMIN_ID:
+        return
     status_msg = await message.answer("📸 Imagen recibida. Analizando ticket o apuesta...")
     try:
         photo = message.photo[-1]
@@ -551,11 +664,19 @@ async def handle_photo_flow(message: Message, state: FSMContext):
 @router.message(F.text & ~F.text.startswith("/"))
 async def handle_user_flow(message: Message, state: FSMContext):
     telegram_id = message.from_user.id
+    if registrar_o_verificar_usuario(telegram_id) == 0 and telegram_id != ADMIN_ID:
+        await message.answer(
+            "🛑 *¡Acceso Restringido!*\nEscríbeme al WhatsApp **3216880439** para activar tu cuenta por solo $10.000 COP.",
+            parse_mode="Markdown",
+            reply_markup=kb_pago_requerido()
+        )
+        return
+
     text = message.text.strip()
     text_lower = text.lower()
 
     if "flashscore" in text_lower or "fotmob" in text_lower:
-        status_msg = await message.answer("🔍 Enlace válido. Extrayendo datos...")
+        status_msg = await message.answer("🔍 Enlace válido. Extrayendo datos (Pre-partido / En vivo)...")
         try:
             scraped_text, _, _ = await fetch_match_data(text)
             if not scraped_text or len(scraped_text.strip()) < 80:
@@ -566,7 +687,7 @@ async def handle_user_flow(message: Message, state: FSMContext):
             return
 
         await state.update_data(scraped_text=scraped_text, last_url=text)
-        await status_msg.edit_text("📊 Analizando tiempo, contexto y estadísticas...")
+        await status_msg.edit_text("📊 Analizando contexto, tiempo y estadísticas...")
         try:
             prompt = f"Datos del partido:\n\n{scraped_text}"
             analysis_result = await gemini_generate_with_retry(SYSTEM_INSTRUCTION, prompt)
@@ -585,11 +706,10 @@ async def handle_user_flow(message: Message, state: FSMContext):
     if scraped_text:
         tiene_numero = re.search(r"\d+[.,]\d+", text)
         
-        # Manejo de "Otras opciones" sin repetir mercados
         if not tiene_numero and ("otra" in text_lower or "opcion" in text_lower or "opción" in text_lower or "mas" in text_lower or "más" in text_lower):
-            refresh_msg = await message.answer("🔄 Buscando opciones tácticas diferentes según el minuto...")
+            refresh_msg = await message.answer("🔄 Buscando opciones tácticas diferentes...")
             try:
-                prompt = f"Datos del partido:\n\n{scraped_text}\n\nGenera 3 mercados COMPLETAMENTE DIFERENTES adaptados estrictamente al tiempo actual del partido (ej: corners, tarjetas o goles agónicos), ultra resumidos."
+                prompt = f"Datos del partido:\n\n{scraped_text}\n\nGenera 3 mercados COMPLETAMENTE DIFERENTES adaptados al estado actual, ultra resumidos."
                 alt_result = await gemini_generate_with_retry(SYSTEM_INSTRUCTION, prompt)
                 await refresh_msg.edit_text(alt_result, reply_markup=kb_cuota(), parse_mode="Markdown")
             except Exception as e:
@@ -597,7 +717,6 @@ async def handle_user_flow(message: Message, state: FSMContext):
                 await refresh_msg.edit_text("❌ No pude generar más opciones en este momento, parcero.")
             return
 
-        # Evaluación de cuota numérica enviada por el usuario
         processing_msg = await message.answer("🤖 Evaluando tu cuota y stake...")
         try:
             prompt = f"Contexto:\n{scraped_text}\n\nCuota elegida:\n{text}"
@@ -614,7 +733,6 @@ async def handle_user_flow(message: Message, state: FSMContext):
             banca = get_banca(telegram_id)
             stake_monto = banca * 0.03 if banca > 0 else 0.0
 
-            # Descontar de la banca automáticamente al apostar
             if stake_monto > 0:
                 descontar_banca(telegram_id, stake_monto)
 
@@ -681,11 +799,10 @@ def start_background_loop(ioloop):
     ioloop.run_forever()
 
 def keep_alive_ping():
-    """Envía una petición HTTP a su propia URL de Render cada 7 minutos para evitar que se duerma."""
     url = WEBHOOK_URL.rstrip('/') + '/'
     while True:
         try:
-            time.sleep(420) # 420 segundos = 7 minutos
+            time.sleep(420)
             resp = req_requests.get(url, timeout=10)
             logging.info(f"Ping Keep-Alive enviado a Render. Status: {resp.status_code}")
         except Exception as e:
@@ -696,11 +813,9 @@ if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
     setup_webhook()
     
-    # Hilo para Telegram Bot
     t = threading.Thread(target=start_background_loop, args=(loop,), daemon=True)
     t.start()
     
-    # Hilo para mantener despierto a Render automáticamente
     ping_thread = threading.Thread(target=keep_alive_ping, daemon=True)
     ping_thread.start()
     
