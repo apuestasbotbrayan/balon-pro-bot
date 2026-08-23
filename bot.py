@@ -244,7 +244,6 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://balon-pro-bot.onrender.com")
 DB_NAME = "bot_database.db"
 
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
-# Modelo actualizado exigido por la nueva API de Google
 GEMINI_MODEL_ID = "gemini-3.6-flash"
 
 async def gemini_generate_with_retry(system_instruction: str, user_prompt: str, max_retries: int = 2):
@@ -464,7 +463,6 @@ async def cb_consultar_banca(callback: CallbackQuery):
 
 @router.message(F.text & ~F.text.startswith("/"))
 async def handle_user_flow(message: Message, state: FSMContext):
-    current_state = await state.get_state()
     telegram_id = message.from_user.id
     text = message.text.strip()
     text_lower = text.lower()
@@ -493,15 +491,11 @@ async def handle_user_flow(message: Message, state: FSMContext):
             await status_msg.edit_text("❌ Error al conectar con Gemini. Intenta de nuevo, parcero.")
         return
 
-    if current_state == AnalysisStates.waiting_for_quota_or_chat.state:
-        data = await state.get_data()
-        scraped_text = data.get("scraped_text", "")
-        last_url = data.get("last_url", "partido")
-        if not scraped_text:
-            await message.answer("⚠️ Envía primero un enlace de partido.")
-            await state.set_state(AnalysisStates.waiting_for_link)
-            return
+    data = await state.get_data()
+    scraped_text = data.get("scraped_text", "")
+    last_url = data.get("last_url", "partido")
 
+    if scraped_text:
         processing_msg = await message.answer("🤖 Evaluando tu cuota...")
         try:
             prompt = f"Contexto:\n{scraped_text}\n\nCuota elegida:\n{text}"
@@ -541,14 +535,13 @@ async def handle_user_flow(message: Message, state: FSMContext):
     await state.set_state(AnalysisStates.waiting_for_link)
 
 # ==========================================
-# 6. WEBHOOKS & FLASK (Bucle Asíncrono Global Seguro)
+# 6. WEBHOOKS & FLASK
 # ==========================================
 web_app = Flask(__name__)
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 dp.include_router(router)
 
-# Creamos un bucle de eventos global para manejar los webhooks sin bloqueos de hilos
 loop = asyncio.new_event_loop()
 asyncio.set_event_loop(loop)
 
@@ -561,7 +554,6 @@ def telegram_webhook():
     if request.headers.get("content-type") == "application/json":
         json_data = request.get_json()
         update = Update.model_validate(json_data, context={"bot": bot})
-        # Ejecutamos la actualización de forma segura dentro del bucle global
         future = asyncio.run_coroutine_threadsafe(dp.feed_update(bot, update), loop)
         try:
             future.result(timeout=25)
@@ -584,7 +576,6 @@ if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
     setup_webhook()
     
-    # Arrancamos el bucle de eventos asíncrono en segundo plano para Flask
     t = threading.Thread(target=start_background_loop, args=(loop,), daemon=True)
     t.start()
     
