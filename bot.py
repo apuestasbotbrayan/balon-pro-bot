@@ -337,7 +337,7 @@ def kb_calificar_apuesta(apuesta_id: int) -> InlineKeyboardMarkup:
     ])
 
 # ==========================================
-# 3. CAPA DE DATOS (SQLite & Google Sheets)
+# 3. CAPA DE DATOS (SQLite, Google Sheets & Códigos)
 # ==========================================
 SCOPES = ["https://www.spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 
@@ -349,7 +349,6 @@ def registrar_en_google_sheets(telegram_id: int, banca: float, estado: str):
         client = gspread.authorize(creds)
         sheet = client.open("BalonPro_Registros").sheet1
         
-        # Intentar buscar si ya existe el usuario por su Telegram ID
         try:
             cell = sheet.find(str(telegram_id))
             if cell:
@@ -360,7 +359,6 @@ def registrar_en_google_sheets(telegram_id: int, banca: float, estado: str):
         except Exception:
             pass
         
-        # Si no existe, agrega nueva fila: [Telegram ID, Banca, Estado (Activo/Inactivo), Fecha]
         sheet.append_row([str(telegram_id), banca, estado, datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
     except Exception as e:
         logging.error(f"Error sincronizando con Google Sheets: {e}")
@@ -373,9 +371,25 @@ def init_db():
             telegram_id INTEGER PRIMARY KEY,
             banca_actual REAL DEFAULT 0,
             activo INTEGER DEFAULT 0,
+            fecha_expiracion TEXT,
             fecha_registro TEXT
         )
     """)
+    try:
+        cursor.execute("ALTER TABLE usuarios ADD COLUMN fecha_expiracion TEXT")
+    except sqlite3.OperationalError:
+        pass
+
+    # Tabla para almacenar códigos de activación (Pines)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS codigos (
+            codigo TEXT PRIMARY KEY,
+            duracion TEXT,
+            usado INTEGER DEFAULT 0,
+            fecha_creacion TEXT
+        )
+    """)
+
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS historial_apuestas (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -391,38 +405,71 @@ def init_db():
     conn.commit()
     conn.close()
 
-def registrar_o_verificar_usuario(telegram_id: int) -> int:
+def verificar_vigencia_usuario(telegram_id: int) -> int:
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("SELECT activo, banca_actual FROM usuarios WHERE telegram_id = ?", (telegram_id,))
+    cursor.execute("SELECT activo, fecha_expiracion, banca_actual FROM usuarios WHERE telegram_id = ?", (telegram_id,))
     row = cursor.fetchone()
     
     if row is None:
         fecha_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         cursor.execute("INSERT INTO usuarios (telegram_id, banca_actual, activo, fecha_registro) VALUES (?, 0, 0, ?)", (telegram_id, fecha_now))
         conn.commit()
-        activo = 0
-        banca = 0.0
-    else:
-        activo, banca = row[0], row[1]
-    conn.close()
+        conn.close()
+        threading.Thread(target=registrar_en_google_sheets, args=(telegram_id, 0.0, "INACTIVO"), daemon=True).start()
+        return 0
     
-    # Sincronizar con Google Sheets en segundo plano
-    estado_str = "ACTIVO" if activo == 1 else "INACTIVO"
-    threading.Thread(target=registrar_en_google_sheets, args=(telegram_id, banca, estado_str), daemon=True).start()
+    activo, fecha_exp, banca = row[0], row[1], row[2]
+    conn.close()
+
+    if activo == 1 and fecha_exp:
+        try:
+            exp_dt = datetime.strptime(fecha_exp, "%Y-%m-%d %H:%M:%S")
+            if datetime.now() > exp_dt:
+                conn = sqlite3.connect(DB_NAME)
+                cursor = conn.cursor()
+                cursor.execute("UPDATE usuarios SET activo = 0 WHERE telegram_id = ?", (telegram_id,))
+                conn.commit()
+                conn.close()
+                threading.Thread(target=registrar_en_google_sheets, args=(telegram_id, banca, "VENCIDO"), daemon=True).start()
+                return 0
+        except Exception:
+            pass
+            
+    estado_str = f"ACTIVO HASTA {fecha_exp}" if activo == 1 and fecha_exp else "INACTIVO"
+    threading.Thread(target=registrar_en_google_sheets, args=(telegram_id, banca if banca else 0.0, estado_str), daemon=True).start()
     return activo
 
-def activar_usuario_db(telegram_id: int):
+def activar_usuario_tiempo_str(telegram_id: int, duracion_str: str = "1m"):
+    ahora = datetime.now()
+    cantidad = int("".join(filter(str.isdigit, duracion_str))) or 1
+    unidad = "".join(filter(str.isalpha, duracion_str)).lower()
+
+    if "d" in unidad:
+        expiracion = ahora + timedelta(days=cantidad)
+    elif "a" in unidad:
+        expiracion = ahora + timedelta(days=cantidad * 365)
+    else:
+        expiracion = ahora + timedelta(days=cantidad * 30)
+
+    expiracion_str = expiracion.strftime("%Y-%m-%d %H:%M:%S")
+
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("UPDATE usuarios SET activo = 1 WHERE telegram_id = ?", (telegram_id,))
+    cursor.execute("""
+        UPDATE usuarios 
+        SET activo = 1, fecha_expiracion = ? 
+        WHERE telegram_id = ?
+    """, (expiracion_str, telegram_id))
     conn.commit()
+    
     cursor.execute("SELECT banca_actual FROM usuarios WHERE telegram_id = ?", (telegram_id,))
     row = cursor.fetchone()
     banca = row[0] if row else 0.0
     conn.close()
     
-    threading.Thread(target=registrar_en_google_sheets, args=(telegram_id, banca, "ACTIVO"), daemon=True).start()
+    threading.Thread(target=registrar_en_google_sheets, args=(telegram_id, banca, f"ACTIVO HASTA {expiracion_str}"), daemon=True).start()
+    return expiracion_str
 
 def get_banca(telegram_id: int) -> float:
     conn = sqlite3.connect(DB_NAME)
@@ -443,11 +490,7 @@ def set_banca(telegram_id: int, monto: float):
     cursor.execute("UPDATE usuarios SET banca_actual = ? WHERE telegram_id = ?", (monto, telegram_id))
     conn.commit()
     conn.close()
-    
-    # Actualizar también en Google Sheets
-    activo = registrar_o_verificar_usuario(telegram_id)
-    estado_str = "ACTIVO" if activo == 1 else "INACTIVO"
-    threading.Thread(target=registrar_en_google_sheets, args=(telegram_id, monto, estado_str), daemon=True).start()
+    verificar_vigencia_usuario(telegram_id)
 
 def descontar_banca(telegram_id: int, monto_stake: float):
     banca_actual = get_banca(telegram_id)
@@ -528,13 +571,14 @@ router = Router()
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     telegram_id = message.from_user.id
-    activo = registrar_o_verificar_usuario(telegram_id)
+    activo = verificar_vigencia_usuario(telegram_id)
 
     if activo == 0 and telegram_id != ADMIN_ID:
         await message.answer(
-            "🛑 *¡Acceso Restringido, mi hermano!*\n\n"
+            "🛑 *¡Acceso Restringido o Suscripción Vencida, mi hermano!*\n\n"
             "El acceso mensual a **Balon Pro AI** cuesta solo **$ 10.000 COP**.\n\n"
-            "💬 Escríbeme al WhatsApp **3216880439** para reportar tu pago y habilitar tu cuenta al instante.",
+            "💬 Escríbeme al WhatsApp **3216880439** para reportar tu pago y recibir tu código de canje.\n"
+            "Si ya tienes un código, actívalo enviando: `/canje [tu_codigo]`",
             parse_mode="Markdown",
             reply_markup=kb_pago_requerido()
         )
@@ -548,35 +592,84 @@ async def cmd_start(message: Message, state: FSMContext):
         reply_markup=kb_proactivo()
     )
 
-# Comando de Administrador para activar clientes: /activar [telegram_id]
-@router.message(Command("activar"))
-async def cmd_activar(message: Message):
+# Comando de Admin para generar códigos cortos listos para copiar y pegar: /generar 1m (o 7d, 1a)
+@router.message(Command("generar"))
+async def cmd_generar(message: Message):
     if message.from_user.id != ADMIN_ID:
         return
-    args = message.text.split(maxsplit=1)
+    args = message.text.split()
+    duracion = args[1].strip() if len(args) > 1 else "1m"
+    
+    # Generar un código corto tipo BP-XXXX (4 caracteres aleatorios en mayúsculas y números)
+    sufijo = ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
+    codigo = f"BP-{sufijo}"
+    fecha_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO codigos (codigo, duracion, usado, fecha_creacion) VALUES (?, ?, 0, ?)", (codigo, duracion, fecha_now))
+    conn.commit()
+    conn.close()
+
+    texto_copiar = (
+        f"🎟️ *¡Código VIP Generado!*\n\n"
+        f"Duración: `{duracion}`\n"
+        f"Código de activación:\n`{codigo}`\n\n"
+        f"📋 *Mensaje listo para enviar al cliente:*\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"¡Hola, mi hermano! ⚽ Recibido tu pago de $10.000 COP. Canjea este código en el bot de Telegram escribiendo exactamente:\n\n"
+        f"`/canje {codigo}`\n\n"
+        f"¡A facturar con Balon Pro AI! 🚀"
+    )
+    await message.answer(texto_copiar, parse_mode="Markdown")
+
+# Comando para que el cliente canjee su código
+@router.message(Command("canje"))
+async def cmd_canje(message: Message):
+    args = message.text.split()
     if len(args) < 2:
-        await message.answer("❌ Usa: `/activar [telegram_id]`")
+        await message.answer("❌ Uso incorrecto. Debes enviar el código así:\n`/canje BP-XXXX`", parse_mode="Markdown")
         return
-    try:
-        target_id = int(args[1].strip())
-        activar_usuario_db(target_id)
-        await message.answer(f"✅ ¡Usuario `{target_id}` activado con éxito y sincronizado en Google Sheets!")
-        try:
-            await bot.send_message(
-                target_id,
-                "🎉 *¡Tu suscripción ha sido activada con éxito!*\n\n"
-                "Ya puedes usar todas las funciones del bot enviando `/start` o mandando el enlace de cualquier partido. ¡A facturar, parcero! 🚀⚽",
-                parse_mode="Markdown"
-            )
-        except Exception:
-            pass
-    except ValueError:
-        await message.answer("❌ ID de Telegram inválido.")
+    
+    codigo_ingresado = args[1].strip().upper()
+    telegram_id = message.from_user.id
+
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT duracion, usado FROM codigos WHERE codigo = ?", (codigo_ingresado,))
+    row = cursor.fetchone()
+
+    if row is None:
+        conn.close()
+        await message.answer("❌ *Código inválido.* Verifica que lo hayas escrito bien, parcero.", parse_mode="Markdown")
+        return
+    
+    duracion, usado = row[0], row[1]
+    if usado == 1:
+        conn.close()
+        await message.answer("⚠️ *Este código ya fue utilizado.* Los códigos son de un solo uso.", parse_mode="Markdown")
+        return
+
+    # Marcar código como usado
+    cursor.execute("UPDATE codigos SET usado = 1 WHERE codigo = ?", (codigo_ingresado,))
+    conn.commit()
+    conn.close()
+
+    # Activar la suscripción al usuario
+    exp_str = activar_usuario_tiempo_str(telegram_id, duracion)
+
+    await message.answer(
+        f"🎉 *¡Código canjeado con éxito!*\n\n"
+        f"Tu cuenta ha sido activada por `{duracion}` (Hasta: {exp_str}).\n"
+        f"Envía `/start` para comenzar a analizar partidos. ¡A facturar, parcero! 🚀⚽",
+        parse_mode="Markdown",
+        reply_markup=kb_proactivo()
+    )
 
 @router.message(Command("banca"))
 async def cmd_banca(message: Message):
     telegram_id = message.from_user.id
-    if registrar_o_verificar_usuario(telegram_id) == 0 and telegram_id != ADMIN_ID:
+    if verificar_vigencia_usuario(telegram_id) == 0 and telegram_id != ADMIN_ID:
         return
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
@@ -599,7 +692,7 @@ async def cmd_banca(message: Message):
 @router.message(Command("historial"))
 async def cmd_historial(message: Message):
     telegram_id = message.from_user.id
-    if registrar_o_verificar_usuario(telegram_id) == 0 and telegram_id != ADMIN_ID:
+    if verificar_vigencia_usuario(telegram_id) == 0 and telegram_id != ADMIN_ID:
         return
     await message.answer(get_historial_text(telegram_id), parse_mode="Markdown")
 
@@ -632,7 +725,7 @@ async def cb_calificar(callback: CallbackQuery):
 @router.message(F.photo)
 async def handle_photo_flow(message: Message, state: FSMContext):
     telegram_id = message.from_user.id
-    if registrar_o_verificar_usuario(telegram_id) == 0 and telegram_id != ADMIN_ID:
+    if verificar_vigencia_usuario(telegram_id) == 0 and telegram_id != ADMIN_ID:
         return
     status_msg = await message.answer("📸 Imagen recibida. Analizando ticket o apuesta...")
     try:
@@ -664,9 +757,9 @@ async def handle_photo_flow(message: Message, state: FSMContext):
 @router.message(F.text & ~F.text.startswith("/"))
 async def handle_user_flow(message: Message, state: FSMContext):
     telegram_id = message.from_user.id
-    if registrar_o_verificar_usuario(telegram_id) == 0 and telegram_id != ADMIN_ID:
+    if verificar_vigencia_usuario(telegram_id) == 0 and telegram_id != ADMIN_ID:
         await message.answer(
-            "🛑 *¡Acceso Restringido!*\nEscríbeme al WhatsApp **3216880439** para activar tu cuenta por solo $10.000 COP.",
+            "🛑 *¡Acceso Restringido o Vencido!*\nEscríbeme al WhatsApp **3216880439** para adquirir tu código o canjealo con `/canje [codigo]`.",
             parse_mode="Markdown",
             reply_markup=kb_pago_requerido()
         )
