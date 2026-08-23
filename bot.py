@@ -366,6 +366,13 @@ def registrar_en_google_sheets(telegram_id: int, banca: float, estado: str):
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
+    
+    # Validar si la tabla usuarios tiene la columna activo, si no, recrearla limpia
+    try:
+        cursor.execute("SELECT activo, fecha_expiracion FROM usuarios LIMIT 1")
+    except sqlite3.OperationalError:
+        cursor.execute("DROP TABLE IF EXISTS usuarios")
+
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS usuarios (
             telegram_id INTEGER PRIMARY KEY,
@@ -375,10 +382,6 @@ def init_db():
             fecha_registro TEXT
         )
     """)
-    try:
-        cursor.execute("ALTER TABLE usuarios ADD COLUMN fecha_expiracion TEXT")
-    except sqlite3.OperationalError:
-        pass
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS codigos (
