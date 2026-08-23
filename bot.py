@@ -16,7 +16,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 
-from openai import OpenAI
+# Usamos Google Generative AI oficial
+import google.generativeai as genai
 from playwright.async_api import async_playwright
 from playwright_stealth import stealth_async
 
@@ -232,37 +233,30 @@ async def fetch_match_data(url: str) -> tuple[str, str, str]:
     return await fetch_flashscore_text(url)
 
 # ==========================================
-# 1. CONFIGURACIÓN Y CLIENTE XAI (GROK)
+# 1. CONFIGURACIÓN Y CLIENTE GEMINI
 # ==========================================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8785828541:AAHuZoLPpmwDYXzXl92b_PxMDxJ3jpY0Q6g")
-XAI_API_KEY = os.getenv("XAI_API_KEY", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "8021280020"))
 
 DB_NAME = "bot_database.db"
 
-# Cliente OpenAI oficial configurado hacia xAI endpoint
-xai_client = OpenAI(
-    api_key=XAI_API_KEY,
-    base_url="https://api.x.ai/v1"
-)
-GROK_MODEL = "grok-4.5"
+# Configuración del cliente oficial Google GenAI
+genai.configure(api_key=GEMINI_API_KEY)
+gemini_model = genai.GenerativeModel("gemini-2.5-flash")
 
-async def grok_generate_with_retry(system_instruction: str, user_prompt: str, max_retries: int = 2):
-    """Llamada a Grok blindada con reintentos automáticos."""
+async def gemini_generate_with_retry(system_instruction: str, user_prompt: str, max_retries: int = 2):
+    """Llamada a Gemini blindada con reintentos automáticos."""
+    full_prompt = f"{system_instruction}\n\n{user_prompt}"
     for attempt in range(max_retries + 1):
         try:
             response = await asyncio.to_thread(
-                xai_client.chat.completions.create,
-                model=GROK_MODEL,
-                messages=[
-                    {"role": "system", "content": system_instruction},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=0.7
+                gemini_model.generate_content,
+                full_prompt
             )
-            return response.choices[0].message.content.strip()
+            return response.text.strip()
         except Exception as e:
-            logging.warning(f"Grok intento {attempt + 1} fallido por error: {e}")
+            logging.warning(f"Gemini intento {attempt + 1} fallido por error: {e}")
             if attempt < max_retries:
                 await asyncio.sleep(2)
                 continue
@@ -648,15 +642,15 @@ async def procesar_combinada(message: Message, state: FSMContext):
             textos.append(f"--- PARTIDO {idx}: {url} ---\n[Error]")
     try:
         prompt = f"Datos combinados para Parlay de {len(partidos)} partidos:\n\n" + "\n\n".join(textos)
-        result = await grok_generate_with_retry(SYSTEM_INSTRUCTION_COMBINADA, prompt)
+        result = await gemini_generate_with_retry(SYSTEM_INSTRUCTION_COMBINADA, prompt)
         increment_user_usage(telegram_id)
         await state.update_data(scraped_text="\n".join(textos), last_url=f"Combinada {len(partidos)} partidos")
         await state.set_state(AnalysisStates.waiting_for_quota_or_chat)
         await message.answer(result + "\n\n✅ Combinada procesada.", reply_markup=kb_cuota())
         await status_msg.delete()
     except Exception as e:
-        logging.error(f'Grok API Error: {e}')
-        await status_msg.edit_text("❌ Error al calcular la combinada con Grok.")
+        logging.error(f'Gemini API Error: {e}')
+        await status_msg.edit_text("❌ Error al calcular la combinada con Gemini.")
 
 @router.callback_query(F.data == "ver_historial")
 async def cb_ver_historial(callback: CallbackQuery):
@@ -737,17 +731,17 @@ async def handle_user_flow(message: Message, state: FSMContext):
         return
 
     await state.update_data(scraped_text=scraped_text, last_url=text)
-    await status_msg.edit_text("📊 Analizando con Grok...")
+    await status_msg.edit_text("📊 Analizando con Gemini...")
     try:
         prompt = f"Datos del partido:\n\n{scraped_text}"
-        analysis_result = await grok_generate_with_retry(SYSTEM_INSTRUCTION, prompt)
+        analysis_result = await gemini_generate_with_retry(SYSTEM_INSTRUCTION, prompt)
         increment_user_usage(telegram_id)
         await message.answer(analysis_result, reply_markup=kb_proactivo())
         await state.set_state(AnalysisStates.waiting_for_quota_or_chat)
         await status_msg.delete()
     except Exception as e:
-        logging.error(f'Grok API Error: {e}')
-        await status_msg.edit_text("❌ Error al conectar con Grok. Intenta de nuevo, parcero.")
+        logging.error(f'Gemini API Error: {e}')
+        await status_msg.edit_text("❌ Error al conectar con Gemini. Intenta de nuevo, parcero.")
 
 async def process_quota_chat(message: Message, state: FSMContext):
     telegram_id = message.from_user.id
@@ -762,7 +756,7 @@ async def process_quota_chat(message: Message, state: FSMContext):
     processing_msg = await message.answer("🤖 Evaluando tu cuota...")
     try:
         prompt = f"Contexto:\n{scraped_text}\n\nCuota elegida:\n{quota_input}"
-        result = await grok_generate_with_retry(SYSTEM_INSTRUCTION_CUOTA, prompt)
+        result = await gemini_generate_with_retry(SYSTEM_INSTRUCTION_CUOTA, prompt)
         
         cuota_val = 0.0
         try:
@@ -790,8 +784,8 @@ async def process_quota_chat(message: Message, state: FSMContext):
         await message.answer("¿Qué hacemos ahora, parcero?", reply_markup=kb_cuota())
         await state.set_state(AnalysisStates.waiting_for_quota_or_chat)
     except Exception as e:
-        logging.error(f'Grok API Error al evaluar cuota: {e}')
-        await processing_msg.edit_text("❌ Error al evaluar la cuota con Grok.")
+        logging.error(f'Gemini API Error al evaluar cuota: {e}')
+        await processing_msg.edit_text("❌ Error al evaluar la cuota con Gemini.")
 
 # ==========================================
 # 6. MAIN & FLASK
@@ -803,7 +797,7 @@ web_app = Flask(__name__)
 
 @web_app.route('/')
 def home():
-    return '¡El Bot de Apuestas con Grok está activo 24/7, mi hermano! 🚀⚽'
+    return '¡El Bot de Apuestas con Gemini está activo 24/7, mi hermano! 🚀⚽'
 
 def run_web():
     port = int(os.getenv('PORT', 10000))
@@ -815,7 +809,7 @@ async def main():
     bot = Bot(token=TELEGRAM_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-    logging.info("Bot iniciado correctamente con Grok (aiogram v3.x)")
+    logging.info("Bot iniciado correctamente con Google Gemini (aiogram v3.x)")
     await dp.start_polling(bot)
 
 if __name__ == '__main__':
