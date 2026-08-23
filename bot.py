@@ -244,7 +244,8 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://balon-pro-bot.onrender.com")
 DB_NAME = "bot_database.db"
 
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
-GEMINI_MODEL_ID = "gemini-2.5-flash"
+# Modelo actualizado exigido por la nueva API de Google
+GEMINI_MODEL_ID = "gemini-3.6-flash"
 
 async def gemini_generate_with_retry(system_instruction: str, user_prompt: str, max_retries: int = 2):
     full_prompt = f"{system_instruction}\n\n{user_prompt}"
@@ -540,29 +541,32 @@ async def handle_user_flow(message: Message, state: FSMContext):
     await state.set_state(AnalysisStates.waiting_for_link)
 
 # ==========================================
-# 6. WEBHOOKS & FLASK
+# 6. WEBHOOKS & FLASK (Bucle Asíncrono Global Seguro)
 # ==========================================
 web_app = Flask(__name__)
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 dp.include_router(router)
 
+# Creamos un bucle de eventos global para manejar los webhooks sin bloqueos de hilos
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
+
 @web_app.route('/')
 def home():
     return '¡El Bot de Apuestas con Webhook y Gemini está activo 24/7, mi hermano! 🚀⚽'
-
-def run_async_update(update_json):
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    update = Update.model_validate(update_json, context={"bot": bot})
-    loop.run_until_complete(dp.feed_update(bot, update))
-    loop.close()
 
 @web_app.route(f"/webhook/{TELEGRAM_TOKEN}", methods=["POST"])
 def telegram_webhook():
     if request.headers.get("content-type") == "application/json":
         json_data = request.get_json()
-        threading.Thread(target=run_async_update, args=(json_data,), daemon=True).start()
+        update = Update.model_validate(json_data, context={"bot": bot})
+        # Ejecutamos la actualización de forma segura dentro del bucle global
+        future = asyncio.run_coroutine_threadsafe(dp.feed_update(bot, update), loop)
+        try:
+            future.result(timeout=25)
+        except Exception as e:
+            logging.error(f"Error procesando update en webhook: {e}")
         return "", 200
     return "Invalid request", 403
 
@@ -571,9 +575,18 @@ def setup_webhook():
     requests_sync = req_requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook?url={url}")
     logging.info(f"Configurando Webhook en Telegram: {requests_sync.text}")
 
+def start_background_loop(ioloop):
+    asyncio.set_event_loop(ioloop)
+    ioloop.run_forever()
+
 if __name__ == '__main__':
     init_db()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
     setup_webhook()
+    
+    # Arrancamos el bucle de eventos asíncrono en segundo plano para Flask
+    t = threading.Thread(target=start_background_loop, args=(loop,), daemon=True)
+    t.start()
+    
     port = int(os.getenv('PORT', 10000))
     web_app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
