@@ -16,12 +16,11 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 
-# Usamos Google Generative AI oficial
-import google.generativeai as genai
+# Cliente oficial moderno de Google GenAI
+from google import genai
 from playwright.async_api import async_playwright
 from playwright_stealth import stealth_async
 
-# HTTP ligero para evadir Cloudflare sin navegador (curl_cffi impersonate Chrome)
 try:
     from curl_cffi import requests as curl_requests
     HAS_CURL = True
@@ -233,7 +232,7 @@ async def fetch_match_data(url: str) -> tuple[str, str, str]:
     return await fetch_flashscore_text(url)
 
 # ==========================================
-# 1. CONFIGURACIÓN Y CLIENTE GEMINI ESTABLE
+# 1. CONFIGURACIÓN CLIENTE OFICIAL GOOGLE GENAI
 # ==========================================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8785828541:AAHuZoLPpmwDYXzXl92b_PxMDxJ3jpY0Q6g")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
@@ -241,17 +240,18 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "8021280020"))
 
 DB_NAME = "bot_database.db"
 
-# Usamos el modelo 1.5-flash que es el estándar más estable y gratuito
-genai.configure(api_key=GEMINI_API_KEY)
-gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+# Inicialización con el nuevo SDK oficial de Google
+ai_client = genai.Client(api_key=GEMINI_API_KEY)
+GEMINI_MODEL_ID = "gemini-2.5-flash"
 
 async def gemini_generate_with_retry(system_instruction: str, user_prompt: str, max_retries: int = 2):
     full_prompt = f"{system_instruction}\n\n{user_prompt}"
     for attempt in range(max_retries + 1):
         try:
             response = await asyncio.to_thread(
-                gemini_model.generate_content,
-                full_prompt
+                ai_client.models.generate_content,
+                model=GEMINI_MODEL_ID,
+                contents=full_prompt,
             )
             return response.text.strip()
         except Exception as e:
@@ -779,8 +779,8 @@ async def process_quota_chat(message: Message, state: FSMContext):
         if banca > 0:
             stake_msg += f"\n💰 Sugerido Stake (3%): {format_pesos(banca*0.03)}"
 
-        await processing_msg.edit_text(result + stake_msg, parse_mode="Markdown")
-        await message.answer("¿Qué hacemos ahora, parcero?", reply_markup=kb_cuota())
+        await processing_msg.edit_text(stake_msg, parse_mode="Markdown")
+        await message.answer(result + "\n\n¿Qué hacemos ahora, parcero?", reply_markup=kb_cuota())
         await state.set_state(AnalysisStates.waiting_for_quota_or_chat)
     except Exception as e:
         logging.error(f'Gemini API Error al evaluar cuota: {e}')
@@ -808,7 +808,7 @@ async def main():
     bot = Bot(token=TELEGRAM_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-    logging.info("Bot iniciado correctamente con Google Gemini (aiogram v3.x)")
+    logging.info("Bot iniciado correctamente con Google GenAI (aiogram v3.x)")
     await dp.start_polling(bot)
 
 if __name__ == '__main__':
