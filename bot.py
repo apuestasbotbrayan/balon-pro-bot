@@ -244,7 +244,7 @@ current_key_index = 0
 ADMIN_ID = int(os.getenv("ADMIN_ID", "8021280020"))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://balon-pro-bot.onrender.com")
 DB_NAME = "bot_database.db"
-GEMINI_MODEL_ID = "gemini-2.5-flash"
+GEMINI_MODEL_ID = "gemini-3.6-flash"
 
 def get_next_ai_client():
     global current_key_index
