@@ -233,7 +233,7 @@ async def fetch_match_data(url: str) -> tuple[str, str, str]:
     return await fetch_flashscore_text(url)
 
 # ==========================================
-# 1. CONFIGURACIÓN Y CLIENTE GEMINI
+# 1. CONFIGURACIÓN Y CLIENTE GEMINI ESTABLE
 # ==========================================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8785828541:AAHuZoLPpmwDYXzXl92b_PxMDxJ3jpY0Q6g")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
@@ -241,12 +241,11 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "8021280020"))
 
 DB_NAME = "bot_database.db"
 
-# Configuración del cliente oficial Google GenAI
+# Usamos el modelo 1.5-flash que es el estándar más estable y gratuito
 genai.configure(api_key=GEMINI_API_KEY)
-gemini_model = genai.GenerativeModel("gemini-2.5-flash")
+gemini_model = genai.GenerativeModel("gemini-1.5-flash")
 
 async def gemini_generate_with_retry(system_instruction: str, user_prompt: str, max_retries: int = 2):
-    """Llamada a Gemini blindada con reintentos automáticos."""
     full_prompt = f"{system_instruction}\n\n{user_prompt}"
     for attempt in range(max_retries + 1):
         try:
