@@ -203,8 +203,8 @@ async def fetch_fotmob_data(url: str) -> tuple[str, str, str]:
             parts = [
                 f"Partido: {teams_txt}",
                 f"Liga: {league}",
-                f"Estado: {estado_txt} | Minuto: {minute} | Marcador: {score}",
-                f"Contexto: {'Partido aún no iniciado - evaluar alineaciones probables, bajas, H2H y tendencias con normalidad para mercados pre-partido' if estado_txt == 'Pre-partido' else f'Partido EN VIVO en {minute} con marcador {score} - usar minuto/marcador para decidir mercados lógicos de cierre.'}"
+                f"Estado: {estado_txt} | Minuto actual: {minute} | Marcador: {score}",
+                f"Contexto temporal: {'Partido pre-partido' if estado_txt == 'Pre-partido' else f'ATENCIÓN EN VIVO: El partido va por el MINUTO {minute} con marcador {score}. Adapta los mercados de riesgo de forma estricta al tiempo restante (ej: si está en el minuto 85+, enfócate en córneres desesperados, goles agónicos o tarjetas por tensión).'}"
             ]
 
             match_facts = content.get("matchFacts") or {}
@@ -234,7 +234,7 @@ async def fetch_match_data(url: str) -> tuple[str, str, str]:
     return await fetch_flashscore_text(url)
 
 # ==========================================
-# 1. ROTACIÓN INTELIGENTE DE API KEYS (Soporte AQ.)
+# 1. ROTACIÓN INTELIGENTE DE API KEYS
 # ==========================================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8785828541:AAHuZoLPpmwDYXzXl92b_PxMDxJ3jpY0Q6g")
 RAW_KEYS = os.getenv("GEMINI_API_KEY", "")
@@ -278,10 +278,11 @@ async def gemini_generate_with_retry(system_instruction: str, user_prompt: str, 
             raise
 
 SYSTEM_INSTRUCTION = (
-    "Actúa como tipster profesional colombiano parcero experto. Cuando recibas datos de un partido (Flashscore/FotMob), "
-    "REVISA CON LUPA las estadísticas, H2H y tendencias. "
+    "Actúa como tipster profesional colombiano parcero experto. "
+    "MUY IMPORTANTE: Analiza con lupa el MINUTO ACTUAL y el MARCADOR del partido en los datos. "
+    "Si el partido está avanzado (ej: minuto 75+), tus Value Bets deben ser de ALTO RIESGO EN VIVO (próximo gol, córneres desesperados, tarjetas por fricción). "
     "SÉ ULTRA RESUMIDO y VISUAL, sin floro. "
-    "Saluda breve parcero ('¡Epa, mi hermano!') y presenta de una 3 Value Bets SÓLIDAS Y DIFERENTES (ej: mezcla goles, tiros de esquina o tarjetas, evita repetir siempre lo mismo). "
+    "Saluda breve parcero ('¡Epa, mi hermano!') y presenta de una 3 Value Bets SÓLIDAS Y ACORDES AL TIEMPO ACTUAL. "
     "PROHIBIDO poner números de cuota falsos. "
     "Formato obligatorio, máximo 1 línea por opción: '🔥 [Mercado]: [por qué en máx 15 palabras] | 📍 Busca en [BetPlay/Wplay/Codere/Zamba]'. "
     "Cierra SIEMPRE exactamente con: '¿Cuál te gusta o qué cuota te ofrece tu casa de apuestas para calcular si le apostamos?'"
@@ -326,7 +327,7 @@ def kb_calificar_apuesta(apuesta_id: int) -> InlineKeyboardMarkup:
     ])
 
 # ==========================================
-# 3. CAPA DE DATOS (SQLite)
+# 3. CAPA DE DATOS (SQLite & Descuento de Banca)
 # ==========================================
 def init_db():
     conn = sqlite3.connect(DB_NAME)
@@ -344,12 +345,17 @@ def init_db():
             partido TEXT,
             mercado TEXT,
             cuota REAL,
+            stake REAL DEFAULT 0,
             estado TEXT DEFAULT 'PENDIENTE',
             fecha TEXT
         )
     """)
     try:
         cursor.execute("ALTER TABLE usuarios ADD COLUMN banca_actual REAL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        cursor.execute("ALTER TABLE historial_apuestas ADD COLUMN stake REAL DEFAULT 0")
     except sqlite3.OperationalError:
         pass
     conn.commit()
@@ -374,6 +380,12 @@ def set_banca(telegram_id: int, monto: float):
     cursor.execute("INSERT OR REPLACE INTO usuarios (telegram_id, banca_actual) VALUES (?, ?)", (telegram_id, monto))
     conn.commit()
     conn.close()
+
+def descontar_banca(telegram_id: int, monto_stake: float):
+    banca_actual = get_banca(telegram_id)
+    if banca_actual > 0:
+        nueva_banca = max(0.0, banca_actual - monto_stake)
+        set_banca(telegram_id, nueva_banca)
 
 def format_pesos(valor: float) -> str:
     return f"$ {int(round(valor)):,.0f}".replace(",", ".")
@@ -469,7 +481,7 @@ async def cmd_banca(message: Message):
             raise ValueError()
         set_banca(telegram_id, monto)
         await message.answer(
-            f"✅ Banca configurada: {format_pesos(monto)}\n"
+            f"✅ Banca actualizada: {format_pesos(monto)}\n"
             f"📊 Stake prudente → 2% = {format_pesos(monto*0.02)} | 3% = {format_pesos(monto*0.03)}",
             reply_markup=kb_proactivo()
         )
@@ -554,7 +566,7 @@ async def handle_user_flow(message: Message, state: FSMContext):
             return
 
         await state.update_data(scraped_text=scraped_text, last_url=text)
-        await status_msg.edit_text("📊 Analizando partido y estadísticas...")
+        await status_msg.edit_text("📊 Analizando tiempo, contexto y estadísticas...")
         try:
             prompt = f"Datos del partido:\n\n{scraped_text}"
             analysis_result = await gemini_generate_with_retry(SYSTEM_INSTRUCTION, prompt)
@@ -575,9 +587,9 @@ async def handle_user_flow(message: Message, state: FSMContext):
         
         # Manejo de "Otras opciones" sin repetir mercados
         if not tiene_numero and ("otra" in text_lower or "opcion" in text_lower or "opción" in text_lower or "mas" in text_lower or "más" in text_lower):
-            refresh_msg = await message.answer("🔄 Buscando opciones tácticas diferentes...")
+            refresh_msg = await message.answer("🔄 Buscando opciones tácticas diferentes según el minuto...")
             try:
-                prompt = f"Datos del partido:\n\n{scraped_text}\n\nGenera 3 mercados COMPLETAMENTE DIFERENTES a los anteriores (por ejemplo, corners, tarjetas o handicaps), ultra resumidos."
+                prompt = f"Datos del partido:\n\n{scraped_text}\n\nGenera 3 mercados COMPLETAMENTE DIFERENTES adaptados estrictamente al tiempo actual del partido (ej: corners, tarjetas o goles agónicos), ultra resumidos."
                 alt_result = await gemini_generate_with_retry(SYSTEM_INSTRUCTION, prompt)
                 await refresh_msg.edit_text(alt_result, reply_markup=kb_cuota(), parse_mode="Markdown")
             except Exception as e:
@@ -586,7 +598,7 @@ async def handle_user_flow(message: Message, state: FSMContext):
             return
 
         # Evaluación de cuota numérica enviada por el usuario
-        processing_msg = await message.answer("🤖 Evaluando tu cuota...")
+        processing_msg = await message.answer("🤖 Evaluando tu cuota y stake...")
         try:
             prompt = f"Contexto:\n{scraped_text}\n\nCuota elegida:\n{text}"
             result = await gemini_generate_with_retry(SYSTEM_INSTRUCTION_CUOTA, prompt)
@@ -599,19 +611,26 @@ async def handle_user_flow(message: Message, state: FSMContext):
             except Exception:
                 pass
 
+            banca = get_banca(telegram_id)
+            stake_monto = banca * 0.03 if banca > 0 else 0.0
+
+            # Descontar de la banca automáticamente al apostar
+            if stake_monto > 0:
+                descontar_banca(telegram_id, stake_monto)
+
             fecha_now = datetime.now().strftime("%Y-%m-%d %H:%M")
             conn = sqlite3.connect(DB_NAME)
             cursor = conn.cursor()
-            cursor.execute("INSERT INTO historial_apuestas (telegram_id, partido, mercado, cuota, estado, fecha) VALUES (?, ?, ?, ?, 'PENDIENTE', ?)", 
-                           (telegram_id, last_url[:300], text[:120], cuota_val, fecha_now))
+            cursor.execute("INSERT INTO historial_apuestas (telegram_id, partido, mercado, cuota, stake, estado, fecha) VALUES (?, ?, ?, ?, ?, 'PENDIENTE', ?)", 
+                           (telegram_id, last_url[:300], text[:120], cuota_val, stake_monto, fecha_now))
             conn.commit()
             hid = cursor.lastrowid
             conn.close()
 
-            banca = get_banca(telegram_id)
+            banca_nueva = get_banca(telegram_id)
             stake_msg = f"\n\n📝 Guardado en historial `#{hid}` ⏳"
-            if banca > 0:
-                stake_msg += f"\n💰 Sugerido Stake (3%): {format_pesos(banca*0.03)}"
+            if stake_monto > 0:
+                stake_msg += f"\n💰 Stake apostado (3%): {format_pesos(stake_monto)}\n📉 Nueva Banca: {format_pesos(banca_nueva)}"
 
             await processing_msg.edit_text(result + stake_msg, parse_mode="Markdown", reply_markup=kb_calificar_apuesta(hid))
             await message.answer("¿Qué otro partido analizamos, parcero? Envíame otro enlace.", reply_markup=kb_proactivo())
