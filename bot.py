@@ -19,7 +19,6 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, Update
 from flask import Flask, request
 
-# Cliente oficial moderno de Google GenAI
 from google import genai
 from playwright.async_api import async_playwright
 from playwright_stealth import stealth_async
@@ -235,7 +234,7 @@ async def fetch_match_data(url: str) -> tuple[str, str, str]:
     return await fetch_flashscore_text(url)
 
 # ==========================================
-# 1. ROTACIÓN INTELIGENTE DE API KEYS
+# 1. ROTACIÓN INTELIGENTE DE API KEYS (Soporte AQ.)
 # ==========================================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8785828541:AAHuZoLPpmwDYXzXl92b_PxMDxJ3jpY0Q6g")
 RAW_KEYS = os.getenv("GEMINI_API_KEY", "")
