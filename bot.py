@@ -7,6 +7,7 @@ import random
 import re
 import sqlite3
 import string
+import threading
 from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -279,13 +280,6 @@ SYSTEM_INSTRUCTION_CUOTA = (
     "Línea 2: justificación corta + casa recomendada: '📍 Búscala en [BetPlay/Wplay/Codere/Zamba]'."
 )
 
-SYSTEM_INSTRUCTION_COMBINADA = (
-    "Actúa como tipster profesional colombiano parcero experto en combinadas/parlays. "
-    "Propón 1 combinada principal de 2-3 selecciones en formato: "
-    "'🔥 [Partido - Mercado]: [por qué 10 palabras] | 📍 BetPlay/Wplay/Codere/Zamba'. "
-    "Cierra con: '¿Cuál te gusta o qué cuota te ofrece tu casa de apuestas para calcular si le apostamos?'"
-)
-
 # ==========================================
 # 2. TECLADOS INLINE (UI/UX)
 # ==========================================
@@ -294,9 +288,6 @@ def kb_proactivo() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(text="📊 Ver Historial", callback_data="ver_historial"),
             InlineKeyboardButton(text="💰 Consultar Banca", callback_data="consultar_banca")
-        ],
-        [
-            InlineKeyboardButton(text="⚽ Modo Combinada", callback_data="modo_combinada")
         ]
     ])
 
@@ -311,17 +302,6 @@ def kb_cuota() -> InlineKeyboardMarkup:
         ]
     ])
 
-def kb_combinada() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="➕ Agregar otro partido", callback_data="agregar_otro")
-        ],
-        [
-            InlineKeyboardButton(text="🔥 Calcular Parlay", callback_data="calcular_parlay"),
-            InlineKeyboardButton(text="❌ Cancelar", callback_data="cancelar_combinada")
-        ]
-    ])
-
 # ==========================================
 # 3. CAPA DE DATOS (SQLite)
 # ==========================================
@@ -331,17 +311,7 @@ def init_db():
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS usuarios (
             telegram_id INTEGER PRIMARY KEY,
-            enlaces_hoy INTEGER DEFAULT 0,
-            fecha_expiracion TEXT,
-            banca_actual REAL DEFAULT 0,
-            ultimo_uso TEXT
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS licencias (
-            codigo TEXT PRIMARY KEY,
-            dias_duracion INTEGER,
-            usado INTEGER DEFAULT 0
+            banca_actual REAL DEFAULT 0
         )
     """)
     cursor.execute("""
@@ -355,62 +325,10 @@ def init_db():
             fecha TEXT
         )
     """)
-    for col, col_def in [("ultimo_uso", "TEXT"), ("banca_actual", "REAL DEFAULT 0")]:
-        try:
-            cursor.execute(f"ALTER TABLE usuarios ADD COLUMN {col} {col_def}")
-        except sqlite3.OperationalError:
-            pass
-    conn.commit()
-    conn.close()
-
-def check_user_access(telegram_id: int):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT enlaces_hoy, fecha_expiracion, ultimo_uso FROM usuarios WHERE telegram_id = ?", (telegram_id,))
-    row = cursor.fetchone()
-    conn.close()
-    if not row:
-        return False, "⛔ Acceso denegado. No estás registrado. Usa /start y proporciona tu código de licencia."
-    enlaces_hoy, fecha_expiracion_str, ultimo_uso = row
     try:
-        exp_date = datetime.strptime(fecha_expiracion_str, "%Y-%m-%d")
-        if datetime.now().date() > exp_date.date():
-            return False, "❌ Tu licencia ha expirado. Contacta al administrador para renovarla."
-    except Exception:
-        return False, "❌ Error al verificar la expiración de tu licencia."
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    if ultimo_uso != today_str:
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute("UPDATE usuarios SET enlaces_hoy = 0, ultimo_uso = ? WHERE telegram_id = ?", (today_str, telegram_id))
-        conn.commit()
-        conn.close()
-        enlaces_hoy = 0
-    if enlaces_hoy >= 15:
-        return False, "🚫 Has alcanzado el límite diario de enlaces. Vuelve mañana."
-    return True, ""
-
-def check_user_valid(telegram_id: int):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT fecha_expiracion FROM usuarios WHERE telegram_id = ?", (telegram_id,))
-    row = cursor.fetchone()
-    conn.close()
-    if not row:
-        return False, "⛔ No estás registrado. Usa /start y tu código de licencia."
-    try:
-        exp_date = datetime.strptime(row[0], "%Y-%m-%d")
-        if datetime.now().date() > exp_date.date():
-            return False, "❌ Tu licencia ha expirado. Contacta al administrador."
-    except Exception:
-        return False, "❌ Error al verificar tu licencia."
-    return True, ""
-
-def increment_user_usage(telegram_id: int):
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("UPDATE usuarios SET enlaces_hoy = enlaces_hoy + 1, ultimo_uso = ? WHERE telegram_id = ?", (today_str, telegram_id))
+        cursor.execute("ALTER TABLE usuarios ADD COLUMN banca_actual REAL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
 
@@ -430,7 +348,7 @@ def get_banca(telegram_id: int) -> float:
 def set_banca(telegram_id: int, monto: float):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("UPDATE usuarios SET banca_actual = ? WHERE telegram_id = ?", (monto, telegram_id))
+    cursor.execute("INSERT OR REPLACE INTO usuarios (telegram_id, banca_actual) VALUES (?, ?)", (telegram_id, monto))
     conn.commit()
     conn.close()
 
@@ -489,94 +407,27 @@ def get_banca_text(telegram_id: int) -> str:
 # 4. MÁQUINA DE ESTADOS (FSM)
 # ==========================================
 class AnalysisStates(StatesGroup):
-    waiting_for_license = State()
     waiting_for_link = State()
     waiting_for_quota_or_chat = State()
-    collecting_combinada = State()
 
 router = Router()
-
-async def activate_license(message: Message, codigo: str, state: FSMContext):
-    telegram_id = message.from_user.id
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT dias_duracion, usado FROM licencias WHERE codigo = ?", (codigo,))
-    row = cursor.fetchone()
-    if not row:
-        conn.close()
-        await message.answer("❌ Código inválido. Verifica e intenta de nuevo.")
-        return
-    dias_duracion, usado = row
-    if usado == 1:
-        conn.close()
-        await message.answer("❌ Este código ya ha sido utilizado.")
-        return
-    cursor.execute("UPDATE licencias SET usado = 1 WHERE codigo = ?", (codigo,))
-    fecha_exp = (datetime.now() + timedelta(days=dias_duracion)).strftime("%Y-%m-%d")
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    cursor.execute("""
-        INSERT OR REPLACE INTO usuarios (telegram_id, enlaces_hoy, fecha_expiracion, ultimo_uso, banca_actual)
-        VALUES (?, 0, ?, ?, 105537)
-    """, (telegram_id, fecha_exp, today_str))
-    conn.commit()
-    conn.close()
-    await state.set_state(AnalysisStates.waiting_for_link)
-    await message.answer(
-        f"✅ ¡Licencia activada, mi hermano!\n"
-        f"📅 Válida por {dias_duracion} días hasta {fecha_exp}.\n\n"
-        f"📎 Pilas pues, envíame un enlace de Flashscore o FotMob y te saco de una las mejores opciones de valor."
-    )
 
 # ==========================================
 # 5. HANDLERS - aiogram v3
 # ==========================================
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
-    telegram_id = message.from_user.id
-    args = message.text.split(maxsplit=1)
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT fecha_expiracion FROM usuarios WHERE telegram_id = ?", (telegram_id,))
-    row = cursor.fetchone()
-    conn.close()
-    if row:
-        try:
-            exp_date = datetime.strptime(row[0], "%Y-%m-%d")
-            if datetime.now().date() <= exp_date.date():
-                await state.set_state(AnalysisStates.waiting_for_link)
-                await message.answer("✅ Licencia activa, parcero. Envíame tu enlace y lo analizamos de una.", reply_markup=kb_proactivo())
-                return
-        except Exception:
-            pass
-    if len(args) > 1:
-        await activate_license(message, args[1].strip(), state)
-        return
+    await state.set_state(AnalysisStates.waiting_for_link)
     await message.answer(
-        "👋 ¡Bienvenido al Tipster Bot Pro, mi hermano!\n\n"
-        "🔒 Para acceder, envía tu código de licencia o usa `/activar TU_CODIGO`"
+        "👋 *¡Bienvenido al Tipster Bot Pro, mi hermano!*\n\n"
+        "📎 Envíame un enlace de Flashscore o FotMob de cualquier partido y te entrego las mejores Value Bets al instante.",
+        parse_mode="Markdown",
+        reply_markup=kb_proactivo()
     )
-    await state.set_state(AnalysisStates.waiting_for_license)
-
-@router.message(Command("activar"))
-async def cmd_activar(message: Message, state: FSMContext):
-    args = message.text.split(maxsplit=1)
-    if len(args) < 2:
-        await message.answer("⚠️ Uso: `/activar TU_CODIGO`")
-        return
-    await activate_license(message, args[1].strip(), state)
-
-@router.message(AnalysisStates.waiting_for_license)
-async def process_license_state(message: Message, state: FSMContext):
-    codigo = message.text.strip().split()[0]
-    await activate_license(message, codigo, state)
 
 @router.message(Command("banca"))
 async def cmd_banca(message: Message):
     telegram_id = message.from_user.id
-    allowed, err_msg = check_user_valid(telegram_id)
-    if not allowed:
-        await message.answer(err_msg)
-        return
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
         await message.answer(get_banca_text(telegram_id), parse_mode="Markdown")
@@ -597,59 +448,7 @@ async def cmd_banca(message: Message):
 
 @router.message(Command("historial"))
 async def cmd_historial(message: Message):
-    telegram_id = message.from_user.id
-    allowed, err_msg = check_user_valid(telegram_id)
-    if not allowed:
-        await message.answer(err_msg)
-        return
-    await message.answer(get_historial_text(telegram_id), parse_mode="Markdown")
-
-@router.message(Command("combinada"))
-async def cmd_combinada(message: Message, state: FSMContext):
-    telegram_id = message.from_user.id
-    allowed, err_msg = check_user_access(telegram_id)
-    if not allowed:
-        await message.answer(err_msg)
-        return
-    await state.set_state(AnalysisStates.collecting_combinada)
-    await state.update_data(partidos_combinada=[])
-    await message.answer("🎯 *Modo Combinada activado!*\nEnvíame enlaces uno por uno.", parse_mode="Markdown", reply_markup=kb_combinada())
-
-@router.message(Command("cancelar"))
-async def cmd_cancelar_combinada(message: Message, state: FSMContext):
-    await state.set_state(AnalysisStates.waiting_for_link)
-    await message.answer("✅ Modo normal activado.", reply_markup=kb_proactivo())
-
-async def procesar_combinada(message: Message, state: FSMContext):
-    telegram_id = message.from_user.id
-    data = await state.get_data()
-    partidos = data.get("partidos_combinada", [])
-    if len(partidos) < 2:
-        await message.answer("⚠️ Necesitas mínimo 2 partidos para combinada.", reply_markup=kb_combinada())
-        return
-    allowed, err_msg = check_user_access(telegram_id)
-    if not allowed:
-        await message.answer(err_msg)
-        return
-    status_msg = await message.answer(f"🔍 Procesando combinada de {len(partidos)} partidos...")
-    textos = []
-    for idx, url in enumerate(partidos, 1):
-        try:
-            txt, _, _ = await fetch_match_data(url)
-            textos.append(f"--- PARTIDO {idx}: {url} ---\n{txt[:2000]}")
-        except Exception:
-            textos.append(f"--- PARTIDO {idx}: {url} ---\n[Error]")
-    try:
-        prompt = f"Datos combinados para Parlay de {len(partidos)} partidos:\n\n" + "\n\n".join(textos)
-        result = await gemini_generate_with_retry(SYSTEM_INSTRUCTION_COMBINADA, prompt)
-        increment_user_usage(telegram_id)
-        await state.update_data(scraped_text="\n".join(textos), last_url=f"Combinada {len(partidos)} partidos")
-        await state.set_state(AnalysisStates.waiting_for_quota_or_chat)
-        await message.answer(result + "\n\n✅ Combinada procesada.", reply_markup=kb_cuota())
-        await status_msg.delete()
-    except Exception as e:
-        logging.error(f'Gemini API Error: {e}')
-        await status_msg.edit_text("❌ Error al calcular la combinada con Gemini.")
+    await message.answer(get_historial_text(message.from_user.id), parse_mode="Markdown")
 
 @router.callback_query(F.data == "ver_historial")
 async def cb_ver_historial(callback: CallbackQuery):
@@ -661,29 +460,6 @@ async def cb_consultar_banca(callback: CallbackQuery):
     await callback.answer()
     await callback.message.answer(get_banca_text(callback.from_user.id), parse_mode="Markdown")
 
-@router.callback_query(F.data == "modo_combinada")
-async def cb_modo_combinada(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    await state.set_state(AnalysisStates.collecting_combinada)
-    await state.update_data(partidos_combinada=[])
-    await callback.message.answer("🎯 *Modo Combinada activado!*\nEnvíame enlaces uno por uno.", parse_mode="Markdown", reply_markup=kb_combinada())
-
-@router.callback_query(F.data == "agregar_otro")
-async def cb_agregar_otro(callback: CallbackQuery):
-    await callback.answer("Envía el siguiente enlace", show_alert=False)
-    await callback.message.answer("📎 Envía el siguiente enlace de partido.", reply_markup=kb_combinada())
-
-@router.callback_query(F.data == "calcular_parlay")
-async def cb_calcular_parlay(callback: CallbackQuery, state: FSMContext):
-    await callback.answer("Calculando parlay... ⏳")
-    await procesar_combinada(callback.message, state)
-
-@router.callback_query(F.data == "cancelar_combinada")
-async def cb_cancelar_combinada(callback: CallbackQuery, state: FSMContext):
-    await callback.answer("Cancelado")
-    await state.set_state(AnalysisStates.waiting_for_link)
-    await callback.message.answer("❌ Combinada cancelada.", reply_markup=kb_proactivo())
-
 @router.message(F.text & ~F.text.startswith("/"))
 async def handle_user_flow(message: Message, state: FSMContext):
     current_state = await state.get_state()
@@ -691,106 +467,80 @@ async def handle_user_flow(message: Message, state: FSMContext):
     text = message.text.strip()
     text_lower = text.lower()
 
-    if current_state == AnalysisStates.collecting_combinada.state:
-        if text_lower in ("listo", "calcular", "calcular_combinada"):
-            await procesar_combinada(message, state)
+    if "flashscore" in text_lower or "fotmob" in text_lower:
+        status_msg = await message.answer("🔍 Enlace válido. Extrayendo datos...")
+        try:
+            scraped_text, _, _ = await fetch_match_data(text)
+            if not scraped_text or len(scraped_text.strip()) < 80:
+                await status_msg.edit_text("❌ No se pudo leer el partido, intenta de nuevo.")
+                return
+        except Exception:
+            await status_msg.edit_text("❌ Error al extraer datos del partido.")
             return
-        if "flashscore" in text_lower or "fotmob" in text_lower:
-            data = await state.get_data()
-            partidos = data.get("partidos_combinada", [])
-            partidos.append(text)
-            await state.update_data(partidos_combinada=partidos)
-            await message.answer(f"✅ Partido agregado ({len(partidos)}).", reply_markup=kb_combinada())
-            return
+
+        await state.update_data(scraped_text=scraped_text, last_url=text)
+        await status_msg.edit_text("📊 Analizando con Gemini...")
+        try:
+            prompt = f"Datos del partido:\n\n{scraped_text}"
+            analysis_result = await gemini_generate_with_retry(SYSTEM_INSTRUCTION, prompt)
+            await message.answer(analysis_result, reply_markup=kb_cuota())
+            await state.set_state(AnalysisStates.waiting_for_quota_or_chat)
+            await status_msg.delete()
+        except Exception as e:
+            logging.error(f'Gemini API Error: {e}')
+            await status_msg.edit_text("❌ Error al conectar con Gemini. Intenta de nuevo, parcero.")
         return
 
     if current_state == AnalysisStates.waiting_for_quota_or_chat.state:
-        if text_lower.startswith("combinada"):
-            await cmd_combinada(message, state)
+        data = await state.get_data()
+        scraped_text = data.get("scraped_text", "")
+        last_url = data.get("last_url", "partido")
+        if not scraped_text:
+            await message.answer("⚠️ Envía primero un enlace de partido.")
+            await state.set_state(AnalysisStates.waiting_for_link)
             return
-        await process_quota_chat(message, state)
-        return
 
-    allowed, err_msg = check_user_access(telegram_id)
-    if not allowed:
-        await message.answer(err_msg)
-        return
-    if "flashscore" not in text.lower() and "fotmob" not in text.lower():
-        await message.answer("⚠️ Envía un enlace válido de Flashscore o FotMob.", reply_markup=kb_proactivo())
-        return
-    
-    status_msg = await message.answer("🔍 Enlace válido. Extrayendo datos...", reply_markup=kb_proactivo())
-    try:
-        scraped_text, minute_live, score_live = await fetch_match_data(text)
-        if not scraped_text or len(scraped_text.strip()) < 150:
-            await status_msg.edit_text("❌ No se pudo leer el partido, intenta de nuevo.")
-            return
-    except Exception:
-        await status_msg.edit_text("❌ Error al extraer datos del partido.")
-        return
-
-    await state.update_data(scraped_text=scraped_text, last_url=text)
-    await status_msg.edit_text("📊 Analizando con Gemini...")
-    try:
-        prompt = f"Datos del partido:\n\n{scraped_text}"
-        analysis_result = await gemini_generate_with_retry(SYSTEM_INSTRUCTION, prompt)
-        increment_user_usage(telegram_id)
-        await message.answer(analysis_result, reply_markup=kb_proactivo())
-        await state.set_state(AnalysisStates.waiting_for_quota_or_chat)
-        await status_msg.delete()
-    except Exception as e:
-        logging.error(f'Gemini API Error: {e}')
-        await status_msg.edit_text("❌ Error al conectar con Gemini. Intenta de nuevo, parcero.")
-
-async def process_quota_chat(message: Message, state: FSMContext):
-    telegram_id = message.from_user.id
-    quota_input = message.text.strip()
-    data = await state.get_data()
-    scraped_text = data.get("scraped_text", "")
-    last_url = data.get("last_url", "partido")
-    if not scraped_text:
-        await message.answer("⚠️ Envía primero un enlace de partido.", reply_markup=kb_proactivo())
-        await state.set_state(AnalysisStates.waiting_for_link)
-        return
-    processing_msg = await message.answer("🤖 Evaluando tu cuota...")
-    try:
-        prompt = f"Contexto:\n{scraped_text}\n\nCuota elegida:\n{quota_input}"
-        result = await gemini_generate_with_retry(SYSTEM_INSTRUCTION_CUOTA, prompt)
-        
-        cuota_val = 0.0
+        processing_msg = await message.answer("🤖 Evaluando tu cuota...")
         try:
-            match = re.search(r"(\d+[.,]\d+)", quota_input)
-            if match:
-                cuota_val = float(match.group(1).replace(",", "."))
-        except Exception:
-            pass
+            prompt = f"Contexto:\n{scraped_text}\n\nCuota elegida:\n{text}"
+            result = await gemini_generate_with_retry(SYSTEM_INSTRUCTION_CUOTA, prompt)
+            
+            cuota_val = 0.0
+            try:
+                match = re.search(r"(\d+[.,]\d+)", text)
+                if match:
+                    cuota_val = float(match.group(1).replace(",", "."))
+            except Exception:
+                pass
 
-        fecha_now = datetime.now().strftime("%Y-%m-%d %H:%M")
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute("INSERT INTO historial_apuestas (telegram_id, partido, mercado, cuota, estado, fecha) VALUES (?, ?, ?, ?, 'PENDIENTE', ?)", 
-                       (telegram_id, last_url[:300], quota_input[:120], cuota_val, fecha_now))
-        conn.commit()
-        hid = cursor.lastrowid
-        conn.close()
+            fecha_now = datetime.now().strftime("%Y-%m-%d %H:%M")
+            conn = sqlite3.connect(DB_NAME)
+            cursor = conn.cursor()
+            cursor.execute("INSERT INTO historial_apuestas (telegram_id, partido, mercado, cuota, estado, fecha) VALUES (?, ?, ?, ?, 'PENDIENTE', ?)", 
+                           (telegram_id, last_url[:300], text[:120], cuota_val, fecha_now))
+            conn.commit()
+            hid = cursor.lastrowid
+            conn.close()
 
-        banca = get_banca(telegram_id)
-        stake_msg = f"\n\n📝 Guardado en historial `#{hid}` ⏳"
-        if banca > 0:
-            stake_msg += f"\n💰 Sugerido Stake (3%): {format_pesos(banca*0.03)}"
+            banca = get_banca(telegram_id)
+            stake_msg = f"\n\n📝 Guardado en historial `#{hid}` ⏳"
+            if banca > 0:
+                stake_msg += f"\n💰 Sugerido Stake (3%): {format_pesos(banca*0.03)}"
 
-        await processing_msg.edit_text(stake_msg, parse_mode="Markdown")
-        await message.answer(result + "\n\n¿Qué hacemos ahora, parcero?", reply_markup=kb_cuota())
-        await state.set_state(AnalysisStates.waiting_for_quota_or_chat)
-    except Exception as e:
-        logging.error(f'Gemini API Error al evaluar cuota: {e}')
-        await processing_msg.edit_text("❌ Error al evaluar la cuota con Gemini.")
+            await processing_msg.edit_text(result + stake_msg, parse_mode="Markdown")
+            await message.answer("¿Qué otro partido analizamos, parcero? Envíame otro enlace.", reply_markup=kb_proactivo())
+            await state.set_state(AnalysisStates.waiting_for_link)
+        except Exception as e:
+            logging.error(f'Gemini API Error al evaluar cuota: {e}')
+            await processing_msg.edit_text("❌ Error al evaluar la cuota con Gemini.")
+        return
+
+    await message.answer("⚠️ Envía un enlace válido de Flashscore o FotMob para empezar.", reply_markup=kb_proactivo())
+    await state.set_state(AnalysisStates.waiting_for_link)
 
 # ==========================================
-# 6. WEBHOOKS & FLASK (Solución Definitiva)
+# 6. WEBHOOKS & FLASK
 # ==========================================
-from flask import Flask, request
-
 web_app = Flask(__name__)
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -800,12 +550,18 @@ dp.include_router(router)
 def home():
     return '¡El Bot de Apuestas con Webhook y Gemini está activo 24/7, mi hermano! 🚀⚽'
 
+def run_async_update(update_json):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    update = Update.model_validate(update_json, context={"bot": bot})
+    loop.run_until_complete(dp.feed_update(bot, update))
+    loop.close()
+
 @web_app.route(f"/webhook/{TELEGRAM_TOKEN}", methods=["POST"])
 def telegram_webhook():
     if request.headers.get("content-type") == "application/json":
-        json_string = request.get_data().decode("utf-8")
-        update = Update.model_validate(json.loads(json_string), context={"bot": bot})
-        asyncio.run(dp.feed_update(bot, update))
+        json_data = request.get_json()
+        threading.Thread(target=run_async_update, args=(json_data,), daemon=True).start()
         return "", 200
     return "Invalid request", 403
 
