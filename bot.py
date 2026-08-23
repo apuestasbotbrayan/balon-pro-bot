@@ -8,6 +8,7 @@ import re
 import sqlite3
 import string
 import threading
+import time
 from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -234,30 +235,44 @@ async def fetch_match_data(url: str) -> tuple[str, str, str]:
     return await fetch_flashscore_text(url)
 
 # ==========================================
-# 1. CONFIGURACIÓN CLIENTE OFICIAL GOOGLE GENAI
+# 1. ROTACIÓN INTELIGENTE DE API KEYS
 # ==========================================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8785828541:AAHuZoLPpmwDYXzXl92b_PxMDxJ3jpY0Q6g")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+RAW_KEYS = os.getenv("GEMINI_API_KEY", "")
+API_KEYS_LIST = [k.strip() for k in RAW_KEYS.split(",") if k.strip()]
+current_key_index = 0
+
 ADMIN_ID = int(os.getenv("ADMIN_ID", "8021280020"))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://balon-pro-bot.onrender.com")
-
 DB_NAME = "bot_database.db"
+GEMINI_MODEL_ID = "gemini-2.5-flash"
 
-ai_client = genai.Client(api_key=GEMINI_API_KEY)
-GEMINI_MODEL_ID = "gemini-3.6-flash"
+def get_next_ai_client():
+    global current_key_index
+    if not API_KEYS_LIST:
+        return genai.Client(api_key=os.getenv("GEMINI_API_KEY", ""))
+    key = API_KEYS_LIST[current_key_index]
+    current_key_index = (current_key_index + 1) % len(API_KEYS_LIST)
+    return genai.Client(api_key=key)
 
-async def gemini_generate_with_retry(system_instruction: str, user_prompt: str, max_retries: int = 2):
+async def gemini_generate_with_retry(system_instruction: str, user_prompt: str, max_retries: int = 3):
     full_prompt = f"{system_instruction}\n\n{user_prompt}"
     for attempt in range(max_retries + 1):
         try:
+            client = get_next_ai_client()
             response = await asyncio.to_thread(
-                ai_client.models.generate_content,
+                client.models.generate_content,
                 model=GEMINI_MODEL_ID,
                 contents=full_prompt,
             )
             return response.text.strip()
         except Exception as e:
-            logging.warning(f"Gemini intento {attempt + 1} fallido por error: {e}")
+            err_str = str(e)
+            logging.warning(f"Intento {attempt + 1} con clave actual falló: {err_str}")
+            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                if attempt < max_retries:
+                    await asyncio.sleep(1)
+                    continue
             if attempt < max_retries:
                 await asyncio.sleep(2)
                 continue
@@ -265,10 +280,10 @@ async def gemini_generate_with_retry(system_instruction: str, user_prompt: str, 
 
 SYSTEM_INSTRUCTION = (
     "Actúa como tipster profesional colombiano parcero experto. Cuando recibas datos de un partido (Flashscore/FotMob), "
-    "REVISA CON LUPA las alineaciones probables y bajas de jugadores clave, además de árbitro, H2H y tendencias. "
+    "REVISA CON LUPA las estadísticas, H2H y tendencias. "
     "SÉ ULTRA RESUMIDO y VISUAL, sin floro. "
-    "Saluda breve parcero ('¡Epa, mi hermano!') y presenta de una las 2 o 3 mejores Value Bets SIN INVENTAR CUOTAS FIJAS. "
-    "PROHIBIDO poner números de cuota falsos (no escribas 'Cuota 1.65' si no te la dieron). "
+    "Saluda breve parcero ('¡Epa, mi hermano!') y presenta de una 3 Value Bets SÓLIDAS Y DIFERENTES (ej: mezcla goles, tiros de esquina o tarjetas, evita repetir siempre lo mismo). "
+    "PROHIBIDO poner números de cuota falsos. "
     "Formato obligatorio, máximo 1 línea por opción: '🔥 [Mercado]: [por qué en máx 15 palabras] | 📍 Busca en [BetPlay/Wplay/Codere/Zamba]'. "
     "Cierra SIEMPRE exactamente con: '¿Cuál te gusta o qué cuota te ofrece tu casa de apuestas para calcular si le apostamos?'"
 )
@@ -282,7 +297,7 @@ SYSTEM_INSTRUCTION_CUOTA = (
 )
 
 # ==========================================
-# 2. TECLADOS INLINE (UI/UX)
+# 2. TECLADOS INLINE
 # ==========================================
 def kb_proactivo() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -300,6 +315,14 @@ def kb_cuota() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(text="📍 Ir a BetPlay", url="https://www.betplay.com.co"),
             InlineKeyboardButton(text="📍 Ir a Wplay", url="https://www.wplay.co")
+        ]
+    ])
+
+def kb_calificar_apuesta(apuesta_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Acertada", callback_data=f"est_ok_{apuesta_id}"),
+            InlineKeyboardButton(text="❌ Fallida", callback_data=f"est_fail_{apuesta_id}")
         ]
     ])
 
@@ -356,6 +379,13 @@ def set_banca(telegram_id: int, monto: float):
 def format_pesos(valor: float) -> str:
     return f"$ {int(round(valor)):,.0f}".replace(",", ".")
 
+def actualizar_estado_apuesta(apuesta_id: int, nuevo_estado: str):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE historial_apuestas SET estado = ? WHERE id = ?", (nuevo_estado, apuesta_id))
+    conn.commit()
+    conn.close()
+
 def get_historial_text(telegram_id: int) -> str:
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
@@ -382,7 +412,7 @@ def get_historial_text(telegram_id: int) -> str:
     for _id, partido, mercado, cuota, estado, fecha in rows:
         emoji = "⏳" if estado == "PENDIENTE" else "🟢" if estado == "ACERTADO" else "🔴"
         estado_txt = "Pendiente" if estado == "PENDIENTE" else "Acertado" if estado == "ACERTADO" else "Fallido"
-        partido_corto = (partido[:45] + "…") if len(partido) > 45 else partido
+        partido_corto = (partido[:40] + "…") if len(partido) > 40 else partido
         cuota_txt = f"{cuota:.2f}" if cuota else "—"
         líneas.append(f"{emoji} `#{_id}` {partido_corto}\n   {mercado} @ {cuota_txt} — {estado_txt}")
     historial_txt = "\n\n".join(líneas)
@@ -414,14 +444,14 @@ class AnalysisStates(StatesGroup):
 router = Router()
 
 # ==========================================
-# 5. HANDLERS - aiogram v3
+# 5. HANDLERS
 # ==========================================
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.set_state(AnalysisStates.waiting_for_link)
     await message.answer(
         "👋 *¡Bienvenido al Tipster Bot Pro, mi hermano!*\n\n"
-        "📎 Envíame un enlace de Flashscore o FotMob de cualquier partido y te entrego las mejores Value Bets al instante.",
+        "📎 Envíame un enlace de Flashscore o FotMob de cualquier partido, o una foto de tu apuesta, y te entrego las mejores Value Bets al instante.",
         parse_mode="Markdown",
         reply_markup=kb_proactivo()
     )
@@ -461,6 +491,52 @@ async def cb_consultar_banca(callback: CallbackQuery):
     await callback.answer()
     await callback.message.answer(get_banca_text(callback.from_user.id), parse_mode="Markdown")
 
+@router.callback_query(F.data.startswith("est_"))
+async def cb_calificar(callback: CallbackQuery):
+    parts = callback.data.split("_")
+    if len(parts) == 3:
+        accion = parts[1]
+        apuesta_id = int(parts[2])
+        nuevo_estado = "ACERTADO" if accion == "ok" else "FALLIDO"
+        actualizar_estado_apuesta(apuesta_id, nuevo_estado)
+        await callback.answer(f"¡Apuesta #{apuesta_id} marcada como {nuevo_estado}!")
+        await callback.message.edit_text(
+            f"✅ *Apuesta `#{apuesta_id}` actualizada con éxito!*\n\n" + get_historial_text(callback.from_user.id),
+            parse_mode="Markdown"
+        )
+    else:
+        await callback.answer("Acción no válida.")
+
+# Manejador de FOTOS (Lectura de imágenes / tiquetes)
+@router.message(F.photo)
+async def handle_photo_flow(message: Message, state: FSMContext):
+    status_msg = await message.answer("📸 Imagen recibida. Analizando ticket o apuesta...")
+    try:
+        photo = message.photo[-1]
+        file_info = await bot.get_file(photo.file_id)
+        file_bytes = await bot.download_file(file_info.file_path)
+        
+        client = get_next_ai_client()
+        prompt_imagen = (
+            "Actúa como tipster profesional colombiano. Analiza esta captura de pantalla de apuestas o partido. "
+            "Extrae los datos clave y da tu veredicto rápido de valor en máximo 3 líneas."
+        )
+        
+        response = await asyncio.to_thread(
+            client.models.generate_content,
+            model=GEMINI_MODEL_ID,
+            contents=[
+                prompt_imagen,
+                {"mime_type": "image/jpeg", "data": file_bytes.read()}
+            ]
+        )
+        
+        await status_msg.edit_text(response.text.strip(), parse_mode="Markdown", reply_markup=kb_proactivo())
+        await state.set_state(AnalysisStates.waiting_for_link)
+    except Exception as e:
+        logging.error(f"Error leyendo imagen: {e}")
+        await status_msg.edit_text("❌ No pude leer bien la imagen, parcero. Intenta de nuevo o pásame el enlace.")
+
 @router.message(F.text & ~F.text.startswith("/"))
 async def handle_user_flow(message: Message, state: FSMContext):
     telegram_id = message.from_user.id
@@ -479,7 +555,7 @@ async def handle_user_flow(message: Message, state: FSMContext):
             return
 
         await state.update_data(scraped_text=scraped_text, last_url=text)
-        await status_msg.edit_text("📊 Analizando con Gemini...")
+        await status_msg.edit_text("📊 Analizando partido y estadísticas...")
         try:
             prompt = f"Datos del partido:\n\n{scraped_text}"
             analysis_result = await gemini_generate_with_retry(SYSTEM_INSTRUCTION, prompt)
@@ -487,8 +563,8 @@ async def handle_user_flow(message: Message, state: FSMContext):
             await state.set_state(AnalysisStates.waiting_for_quota_or_chat)
             await status_msg.delete()
         except Exception as e:
-            logging.error(f'Gemini API Error: {e}')
-            await status_msg.edit_text("❌ Error al conectar con Gemini. Intenta de nuevo, parcero.")
+            logging.error(f'API Error: {e}')
+            await status_msg.edit_text("❌ Error al procesar el partido. Intenta de nuevo, parcero.")
         return
 
     data = await state.get_data()
@@ -496,6 +572,21 @@ async def handle_user_flow(message: Message, state: FSMContext):
     last_url = data.get("last_url", "partido")
 
     if scraped_text:
+        tiene_numero = re.search(r"\d+[.,]\d+", text)
+        
+        # Manejo de "Otras opciones" sin repetir mercados
+        if not tiene_numero and ("otra" in text_lower or "opcion" in text_lower or "opción" in text_lower or "mas" in text_lower or "más" in text_lower):
+            refresh_msg = await message.answer("🔄 Buscando opciones tácticas diferentes...")
+            try:
+                prompt = f"Datos del partido:\n\n{scraped_text}\n\nGenera 3 mercados COMPLETAMENTE DIFERENTES a los anteriores (por ejemplo, corners, tarjetas o handicaps), ultra resumidos."
+                alt_result = await gemini_generate_with_retry(SYSTEM_INSTRUCTION, prompt)
+                await refresh_msg.edit_text(alt_result, reply_markup=kb_cuota(), parse_mode="Markdown")
+            except Exception as e:
+                logging.error(f'Error generando opciones alternativas: {e}')
+                await refresh_msg.edit_text("❌ No pude generar más opciones en este momento, parcero.")
+            return
+
+        # Evaluación de cuota numérica enviada por el usuario
         processing_msg = await message.answer("🤖 Evaluando tu cuota...")
         try:
             prompt = f"Contexto:\n{scraped_text}\n\nCuota elegida:\n{text}"
@@ -523,19 +614,19 @@ async def handle_user_flow(message: Message, state: FSMContext):
             if banca > 0:
                 stake_msg += f"\n💰 Sugerido Stake (3%): {format_pesos(banca*0.03)}"
 
-            await processing_msg.edit_text(result + stake_msg, parse_mode="Markdown")
+            await processing_msg.edit_text(result + stake_msg, parse_mode="Markdown", reply_markup=kb_calificar_apuesta(hid))
             await message.answer("¿Qué otro partido analizamos, parcero? Envíame otro enlace.", reply_markup=kb_proactivo())
             await state.set_state(AnalysisStates.waiting_for_link)
         except Exception as e:
-            logging.error(f'Gemini API Error al evaluar cuota: {e}')
-            await processing_msg.edit_text("❌ Error al evaluar la cuota con Gemini.")
+            logging.error(f'API Error al evaluar cuota: {e}')
+            await processing_msg.edit_text("❌ Error al evaluar la cuota.")
         return
 
     await message.answer("⚠️ Envía un enlace válido de Flashscore o FotMob para empezar.", reply_markup=kb_proactivo())
     await state.set_state(AnalysisStates.waiting_for_link)
 
 # ==========================================
-# 6. WEBHOOKS & FLASK
+# 6. WEBHOOKS, FLASK & KEEP-ALIVE PING
 # ==========================================
 web_app = Flask(__name__)
 bot = Bot(token=TELEGRAM_TOKEN)
@@ -547,7 +638,7 @@ asyncio.set_event_loop(loop)
 
 @web_app.route('/')
 def home():
-    return '¡El Bot de Apuestas con Webhook y Gemini está activo 24/7, mi hermano! 🚀⚽'
+    return '¡El Bot Pro está activo 24/7, mi hermano! 🚀⚽'
 
 @web_app.route(f"/webhook/{TELEGRAM_TOKEN}", methods=["POST"])
 def telegram_webhook():
@@ -571,13 +662,29 @@ def start_background_loop(ioloop):
     asyncio.set_event_loop(ioloop)
     ioloop.run_forever()
 
+def keep_alive_ping():
+    """Envía una petición HTTP a su propia URL de Render cada 7 minutos para evitar que se duerma."""
+    url = WEBHOOK_URL.rstrip('/') + '/'
+    while True:
+        try:
+            time.sleep(420) # 420 segundos = 7 minutos
+            resp = req_requests.get(url, timeout=10)
+            logging.info(f"Ping Keep-Alive enviado a Render. Status: {resp.status_code}")
+        except Exception as e:
+            logging.warning(f"Error en el ping Keep-Alive: {e}")
+
 if __name__ == '__main__':
     init_db()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
     setup_webhook()
     
+    # Hilo para Telegram Bot
     t = threading.Thread(target=start_background_loop, args=(loop,), daemon=True)
     t.start()
+    
+    # Hilo para mantener despierto a Render automáticamente
+    ping_thread = threading.Thread(target=keep_alive_ping, daemon=True)
+    ping_thread.start()
     
     port = int(os.getenv('PORT', 10000))
     web_app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
