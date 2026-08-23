@@ -23,10 +23,6 @@ from google import genai
 from playwright.async_api import async_playwright
 from playwright_stealth import stealth_async
 
-# Importaciones para Google Sheets
-import gspread
-from google.oauth2.service_account import Credentials
-
 try:
     from curl_cffi import requests as curl_requests
     HAS_CURL = True
@@ -337,42 +333,11 @@ def kb_calificar_apuesta(apuesta_id: int) -> InlineKeyboardMarkup:
     ])
 
 # ==========================================
-# 3. CAPA DE DATOS (SQLite, Google Sheets & Códigos)
+# 3. CAPA DE DATOS (SQLite & Códigos)
 # ==========================================
-SCOPES = ["https://www.spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-
-def registrar_en_google_sheets(telegram_id: int, banca: float, estado: str):
-    try:
-        if not os.path.exists("credentials.json"):
-            return
-        creds = Credentials.from_service_account_file("credentials.json", scopes=SCOPES)
-        client = gspread.authorize(creds)
-        sheet = client.open("BalonPro_Registros").sheet1
-        
-        try:
-            cell = sheet.find(str(telegram_id))
-            if cell:
-                sheet.update_cell(cell.row, 2, banca)
-                sheet.update_cell(cell.row, 3, estado)
-                sheet.update_cell(cell.row, 4, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-                return
-        except Exception:
-            pass
-        
-        sheet.append_row([str(telegram_id), banca, estado, datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
-    except Exception as e:
-        logging.error(f"Error sincronizando con Google Sheets: {e}")
-
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    
-    # Validar si la tabla usuarios tiene la columna activo, si no, recrearla limpia
-    try:
-        cursor.execute("SELECT activo, fecha_expiracion FROM usuarios LIMIT 1")
-    except sqlite3.OperationalError:
-        cursor.execute("DROP TABLE IF EXISTS usuarios")
-
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS usuarios (
             telegram_id INTEGER PRIMARY KEY,
@@ -382,6 +347,10 @@ def init_db():
             fecha_registro TEXT
         )
     """)
+    try:
+        cursor.execute("ALTER TABLE usuarios ADD COLUMN fecha_expiracion TEXT")
+    except sqlite3.OperationalError:
+        pass
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS codigos (
@@ -410,7 +379,7 @@ def init_db():
 def verificar_vigencia_usuario(telegram_id: int) -> int:
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("SELECT activo, fecha_expiracion, banca_actual FROM usuarios WHERE telegram_id = ?", (telegram_id,))
+    cursor.execute("SELECT activo, fecha_expiracion FROM usuarios WHERE telegram_id = ?", (telegram_id,))
     row = cursor.fetchone()
     
     if row is None:
@@ -418,10 +387,9 @@ def verificar_vigencia_usuario(telegram_id: int) -> int:
         cursor.execute("INSERT INTO usuarios (telegram_id, banca_actual, activo, fecha_registro) VALUES (?, 0, 0, ?)", (telegram_id, fecha_now))
         conn.commit()
         conn.close()
-        threading.Thread(target=registrar_en_google_sheets, args=(telegram_id, 0.0, "INACTIVO"), daemon=True).start()
         return 0
     
-    activo, fecha_exp, banca = row[0], row[1], row[2]
+    activo, fecha_exp = row[0], row[1]
     conn.close()
 
     if activo == 1 and fecha_exp:
@@ -433,13 +401,10 @@ def verificar_vigencia_usuario(telegram_id: int) -> int:
                 cursor.execute("UPDATE usuarios SET activo = 0 WHERE telegram_id = ?", (telegram_id,))
                 conn.commit()
                 conn.close()
-                threading.Thread(target=registrar_en_google_sheets, args=(telegram_id, banca, "VENCIDO"), daemon=True).start()
                 return 0
         except Exception:
             pass
             
-    estado_str = f"ACTIVO HASTA {fecha_exp}" if activo == 1 and fecha_exp else "INACTIVO"
-    threading.Thread(target=registrar_en_google_sheets, args=(telegram_id, banca if banca else 0.0, estado_str), daemon=True).start()
     return activo
 
 def activar_usuario_tiempo_str(telegram_id: int, duracion_str: str = "1m"):
@@ -459,18 +424,12 @@ def activar_usuario_tiempo_str(telegram_id: int, duracion_str: str = "1m"):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute("""
-        UPDATE usuarios 
-        SET activo = 1, fecha_expiracion = ? 
-        WHERE telegram_id = ?
-    """, (expiracion_str, telegram_id))
+        INSERT INTO usuarios (telegram_id, activo, fecha_expiracion, fecha_registro) 
+        VALUES (?, 1, ?, ?)
+        ON CONFLICT(telegram_id) DO UPDATE SET activo = 1, fecha_expiracion = ?
+    """, (telegram_id, expiracion_str, ahora.strftime("%Y-%m-%d %H:%M:%S"), expiracion_str))
     conn.commit()
-    
-    cursor.execute("SELECT banca_actual FROM usuarios WHERE telegram_id = ?", (telegram_id,))
-    row = cursor.fetchone()
-    banca = row[0] if row else 0.0
     conn.close()
-    
-    threading.Thread(target=registrar_en_google_sheets, args=(telegram_id, banca, f"ACTIVO HASTA {expiracion_str}"), daemon=True).start()
     return expiracion_str
 
 def get_banca(telegram_id: int) -> float:
@@ -489,10 +448,14 @@ def get_banca(telegram_id: int) -> float:
 def set_banca(telegram_id: int, monto: float):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("UPDATE usuarios SET banca_actual = ? WHERE telegram_id = ?", (monto, telegram_id))
+    # Si el usuario no existe en la tabla, lo inserta con la banca; si ya existe, se la actualiza sin tocar su estado activo
+    cursor.execute("""
+        INSERT INTO usuarios (telegram_id, banca_actual, fecha_registro) 
+        VALUES (?, ?, ?)
+        ON CONFLICT(telegram_id) DO UPDATE SET banca_actual = ?
+    """, (telegram_id, monto, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), monto))
     conn.commit()
     conn.close()
-    verificar_vigencia_usuario(telegram_id)
 
 def descontar_banca(telegram_id: int, monto_stake: float):
     banca_actual = get_banca(telegram_id)
