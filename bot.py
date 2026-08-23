@@ -245,7 +245,7 @@ xai_client = OpenAI(
     api_key=XAI_API_KEY,
     base_url="https://api.x.ai/v1"
 )
-GROK_MODEL = "grok-4.6"
+GROK_MODEL = "grok-2"
 
 async def grok_generate_with_retry(system_instruction: str, user_prompt: str, max_retries: int = 2):
     """Llamada a Grok blindada con reintentos automáticos."""
@@ -258,8 +258,7 @@ async def grok_generate_with_retry(system_instruction: str, user_prompt: str, ma
                     {"role": "system", "content": system_instruction},
                     {"role": "user", "content": user_prompt}
                 ],
-                temperature=0.7,
-                timeout=30.0
+                temperature=0.7
             )
             return response.choices[0].message.content.strip()
         except Exception as e:
