@@ -243,7 +243,7 @@ current_key_index = 0
 
 ADMIN_ID = int(os.getenv("ADMIN_ID", "8021280020"))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://balon-pro-bot.onrender.com")
-DB_NAME = "bot_database.db"
+DB_NAME = "bot_database_v2.db"
 GEMINI_MODEL_ID = "gemini-3.6-flash"
 
 def get_next_ai_client():
@@ -347,11 +347,6 @@ def init_db():
             fecha_registro TEXT
         )
     """)
-    try:
-        cursor.execute("ALTER TABLE usuarios ADD COLUMN fecha_expiracion TEXT")
-    except sqlite3.OperationalError:
-        pass
-
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS codigos (
             codigo TEXT PRIMARY KEY,
@@ -360,7 +355,6 @@ def init_db():
             fecha_creacion TEXT
         )
     """)
-
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS historial_apuestas (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -448,7 +442,6 @@ def get_banca(telegram_id: int) -> float:
 def set_banca(telegram_id: int, monto: float):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    # Si el usuario no existe en la tabla, lo inserta con la banca; si ya existe, se la actualiza sin tocar su estado activo
     cursor.execute("""
         INSERT INTO usuarios (telegram_id, banca_actual, fecha_registro) 
         VALUES (?, ?, ?)
