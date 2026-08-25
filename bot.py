@@ -286,10 +286,12 @@ SYSTEM_INSTRUCTION = (
 )
 
 SYSTEM_INSTRUCTION_CUOTA = (
-    "Actúa como tipster colombiano firme y directo. Calcula Probabilidad Implícita y EV internamente. "
-    "Responde AL GRANO en MÁXIMO 2 LÍNEAS: "
-    "Línea 1: veredicto con emoji: si EV >5% -> '🟢 ¡Métale con confianza!' si no -> '🔴 ¡Pilas, no bote la plata por ahí!'. "
-    "Línea 2: justificación corta + casa recomendada: '📍 Búscala en [BetPlay/Wplay/Codere/Zamba]'."
+    "Actúa como tipster colombiano firme y directo. El usuario te dará una opción elegida junto con la cuota o una modificación de la línea de la casa de apuestas (por ejemplo, cambió de 8.5 a 9.5 córners). "
+    "Analiza si la nueva línea o cuota tiene valor real (EV > 5%). "
+    "Responde en MÁXIMO 3 LÍNEAS: "
+    "Línea 1: veredicto con emoji: si hay valor -> '🟢 ¡Métale con confianza!' si no -> '🔴 ¡Pilas, no bote la plata por ahí!'. "
+    "Línea 2: breve análisis adaptado a la nueva línea o cuota aportada. "
+    "Línea 3: casa recomendada: '📍 Búscala en [BetPlay/Wplay/Codere/Zamba]'."
 )
 
 # ==========================================
@@ -688,7 +690,7 @@ async def cb_elegir_opcion_handler(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AnalysisStates.waiting_for_quota)
     await callback.message.answer(
         f"✅ Seleccionaste la *{opcion_elegida}*.\n\n"
-        "💰 Ahora dime: **¿Qué cuota exacta te ofreció tu casa de apuestas (Wplay/BetPlay)?** (Ej: `1.75`)",
+        "💰 Ahora dime: **¿Qué cuota exacta te ofreció tu casa de apuestas o si cambió la línea?** (Ej: `1.75` o `En Wplay me sale 9.5 córners a 1.80`)",
         parse_mode="Markdown"
     )
 
@@ -739,16 +741,16 @@ async def handle_user_flow(message: Message, state: FSMContext):
     text_lower = text.lower()
     current_state = await state.get_state()
 
-    # Si está esperando la cuota tras haber seleccionado un botón
+    # Si está esperando la cuota o corrección de línea tras haber seleccionado un botón
     if current_state == AnalysisStates.waiting_for_quota.state:
-        processing_msg = await message.answer("🤖 Evaluando cuota, calculando EV y registrando en la base de datos...")
+        processing_msg = await message.answer("🤖 Reajustando análisis con la línea de tu casa de apuestas y calculando EV...")
         data = await state.get_data()
         scraped_text = data.get("scraped_text", "")
         last_url = data.get("last_url", "partido")
         chosen_option = data.get("chosen_option", "Apuesta")
 
         try:
-            prompt = f"Contexto del partido:\n{scraped_text}\n\nOpción elegida por el usuario ({chosen_option}) con cuota:\n{text}"
+            prompt = f"Contexto del partido:\n{scraped_text}\n\nOpción elegida por el usuario: {chosen_option}\nAjuste o cuota indicada por el usuario:\n{text}"
             result = await gemini_generate_with_retry(SYSTEM_INSTRUCTION_CUOTA, prompt)
             
             cuota_val = 0.0
@@ -783,8 +785,8 @@ async def handle_user_flow(message: Message, state: FSMContext):
             await message.answer("¿Qué otro partido analizamos, parcero? Envíame otro enlace.", reply_markup=kb_proactivo())
             await state.set_state(AnalysisStates.waiting_for_link)
         except Exception as e:
-            logging.error(f'API Error al evaluar cuota: {e}')
-            await processing_msg.edit_text("❌ Error al evaluar la cuota, parcero.")
+            logging.error(f'API Error al evaluar cuota/línea: {e}')
+            await processing_msg.edit_text("❌ Error al procesar el ajuste, parcero.")
             await state.set_state(AnalysisStates.waiting_for_link)
         return
 
