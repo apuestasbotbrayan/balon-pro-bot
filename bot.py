@@ -313,7 +313,8 @@ def kb_proactivo() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="💰 Consultar Banca", callback_data="consultar_banca")
         ],
         [
-            InlineKeyboardButton(text="🔗 Analizar Parley Sencillo", callback_data="iniciar_combinada")
+            InlineKeyboardButton(text="🔗 Parley Sencillo", callback_data="iniciar_combinada"),
+            InlineKeyboardButton(text="⚡ Parley Combinado", callback_data="iniciar_combinada")
         ]
     ])
 
@@ -572,7 +573,7 @@ async def cmd_start(message: Message, state: FSMContext):
     await state.set_state(AnalysisStates.waiting_for_link)
     await message.answer(
         "👋 *¡Bienvenido al Tipster Bot Pro, mi hermano!*\n\n"
-        "📎 Envíame un enlace de Flashscore o FotMob, o toca el botón para armar un **Parley Sencillo**.",
+        "📎 Envíame un enlace de Flashscore o FotMob, o toca un botón del menú para elegir tu jugada.",
         parse_mode="Markdown",
         reply_markup=kb_proactivo()
     )
@@ -589,7 +590,7 @@ async def cb_iniciar_combinada(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AnalysisStates.waiting_for_combinada_links)
     await state.update_data(combinada_links=[])
     await callback.message.answer(
-        "🔗 *Modo Analizar Parley Sencillo Activado*\n\n"
+        "🔗 *Modo Analizar Parley / Combinado Activado*\n\n"
         "Envíame de **3 a 5 enlaces** de partidos (uno por uno o todos juntos en un mensaje). Cuando termines, escribe la palabra `analizar`.",
         parse_mode="Markdown"
     )
@@ -778,7 +779,7 @@ async def handle_user_flow(message: Message, state: FSMContext):
     text_lower = text.lower()
     current_state = await state.get_state()
 
-    # --- FLUJO DE COMBINADA (PARLEY SENCILLO) ---
+    # --- FLUJO DE COMBINADA / PARLEY ---
     if current_state == AnalysisStates.waiting_for_combinada_links.state:
         data = await state.get_data()
         links_list = data.get("combinada_links", [])
@@ -808,14 +809,13 @@ async def handle_user_flow(message: Message, state: FSMContext):
                 prompt_combinada = "Datos de los partidos:\n\n" + "\n\n".join(scraped_texts)
                 result = await gemini_generate_with_retry(SYSTEM_INSTRUCTION_COMBINADA, prompt_combinada)
 
-                # Extraer cuota total estimada de la respuesta de la IA
-                cuota_val = 2.50  # Valor por defecto seguro
+                cuota_val = 2.50
                 match_cuota = re.search(r"cuota total estimada[:\s]*(\d+[.,]\d+)", result, re.IGNORECASE)
                 if match_cuota:
                     cuota_val = float(match_cuota.group(1).replace(",", "."))
 
                 banca = get_banca(telegram_id)
-                stake_monto = banca * 0.02 if banca > 0 else 0.0  # 2% recomendado para combinadas
+                stake_monto = banca * 0.02 if banca > 0 else 0.0
 
                 if stake_monto > 0:
                     descontar_banca(telegram_id, stake_monto)
@@ -824,7 +824,7 @@ async def handle_user_flow(message: Message, state: FSMContext):
                 conn = sqlite3.connect(DB_NAME)
                 cursor = conn.cursor()
                 cursor.execute("INSERT INTO historial_apuestas (telegram_id, partido, mercado, cuota, stake, estado, fecha) VALUES (?, ?, ?, ?, ?, 'PENDIENTE', ?)", 
-                               (telegram_id, "Parley Sencillo (Multi-partido)", "Combinada Maestra", cuota_val, stake_monto, fecha_now))
+                               (telegram_id, "Parley / Combinada", "Combinada Maestra", cuota_val, stake_monto, fecha_now))
                 conn.commit()
                 hid = cursor.lastrowid
                 conn.close()
