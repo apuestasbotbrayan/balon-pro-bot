@@ -20,8 +20,6 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 from flask import Flask, request
 
 from google import genai
-from playwright.async_api import async_playwright
-from playwright_stealth import stealth_async
 
 try:
     from curl_cffi import requests as curl_requests
@@ -277,19 +275,18 @@ async def gemini_generate_with_retry(system_instruction: str, user_prompt: str, 
             raise
 
 SYSTEM_INSTRUCTION = (
-    "Actúa como tipster profesional colombiano parcero experto. "
-    "MUY IMPORTANTE: Analiza con lupa el MINUTO ACTUAL y el MARCADOR del partido en los datos. "
-    "Si el partido está avanzado (ej: minuto 75+), tus Value Bets deben ser de ALTO RIESGO EN VIVO. "
-    "SÉ ULTRA RESUMIDO y VISUAL, sin floro. "
-    "Saluda breve parcero ('¡Epa, mi hermano!') y presenta de una 3 Value Bets SÓLIDAS Y ACORDES AL TIEMPO ACTUAL. "
+    "Actúa como tipster profesional colombiano experto y de máxima exigencia. "
+    "Analiza con lupa el MINUTO ACTUAL y el MARCADOR del partido. "
+    "Presenta exactamente DOS opciones de alta convicción y valor (Opción A y Opción B), variando inteligentemente entre mercados estables (tiros de esquina/córners, doble oportunidad o goles calculados). "
     "PROHIBIDO poner números de cuota falsos. "
-    "Formato obligatorio, máximo 1 línea por opción: '🔥 [Mercado]: [por qué en máx 15 palabras] | 📍 Busca en [BetPlay/Wplay/Codere/Zamba]'. "
-    "Cierra SIEMPRE exactamente con: '¿Cuál te gusta o qué cuota te ofrece tu casa de apuestas para calcular si le apostamos?'"
+    "Formato obligatorio exacto:\n"
+    "OPCIÓN A: [Mercado y justificación corta] | 📍 [Casa]\n"
+    "OPCIÓN B: [Mercado y justificación corta] | 📍 [Casa]\n"
+    "Cierra SIEMPRE exactamente con: 'Selecciona abajo cuál opción jugaste:'"
 )
 
 SYSTEM_INSTRUCTION_CUOTA = (
-    "Actúa como tipster colombiano parcero firme y directo. Cuando el usuario te dé una cuota/mercado, "
-    "calcula Probabilidad Implícita y EV internamente sin mostrar fórmulas largas. "
+    "Actúa como tipster colombiano firme y directo. Calcula Probabilidad Implícita y EV internamente. "
     "Responde AL GRANO en MÁXIMO 2 LÍNEAS: "
     "Línea 1: veredicto con emoji: si EV >5% -> '🟢 ¡Métale con confianza!' si no -> '🔴 ¡Pilas, no bote la plata por ahí!'. "
     "Línea 2: justificación corta + casa recomendada: '📍 Búscala en [BetPlay/Wplay/Codere/Zamba]'."
@@ -313,14 +310,14 @@ def kb_pago_requerido() -> InlineKeyboardMarkup:
         ]
     ])
 
-def kb_cuota() -> InlineKeyboardMarkup:
+def kb_elegir_opcion(mercado_a: str, mercado_b: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="📋 Ver mi Historial", callback_data="ver_historial")
+            InlineKeyboardButton(text="📲 Jugué Opción A", callback_data="sel_opA"),
+            InlineKeyboardButton(text="📲 Jugué Opción B", callback_data="sel_opB")
         ],
         [
-            InlineKeyboardButton(text="📍 Ir a BetPlay", url="https://www.betplay.com.co"),
-            InlineKeyboardButton(text="📍 Ir a Wplay", url="https://www.wplay.co")
+            InlineKeyboardButton(text="📋 Ver Historial", callback_data="ver_historial")
         ]
     ])
 
@@ -371,6 +368,8 @@ def init_db():
     conn.close()
 
 def verificar_vigencia_usuario(telegram_id: int) -> int:
+    if telegram_id == ADMIN_ID:
+        return 1
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute("SELECT activo, fecha_expiracion FROM usuarios WHERE telegram_id = ?", (telegram_id,))
@@ -524,7 +523,8 @@ def get_banca_text(telegram_id: int) -> str:
 # ==========================================
 class AnalysisStates(StatesGroup):
     waiting_for_link = State()
-    waiting_for_quota_or_chat = State()
+    waiting_for_option_choice = State()
+    waiting_for_quota = State()
 
 router = Router()
 
@@ -680,6 +680,18 @@ async def cb_calificar(callback: CallbackQuery):
     else:
         await callback.answer("Acción no válida.")
 
+@router.callback_query(F.data.in_({"sel_opA", "sel_opB"}))
+async def cb_elegir_opcion_handler(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    opcion_elegida = "Opción A" if callback.data == "sel_opA" else "Opción B"
+    await state.update_data(chosen_option=opcion_elegida)
+    await state.set_state(AnalysisStates.waiting_for_quota)
+    await callback.message.answer(
+        f"✅ Seleccionaste la *{opcion_elegida}*.\n\n"
+        "💰 Ahora dime: **¿Qué cuota exacta te ofreció tu casa de apuestas (Wplay/BetPlay)?** (Ej: `1.75`)",
+        parse_mode="Markdown"
+    )
+
 @router.message(F.photo)
 async def handle_photo_flow(message: Message, state: FSMContext):
     telegram_id = message.from_user.id
@@ -725,52 +737,18 @@ async def handle_user_flow(message: Message, state: FSMContext):
 
     text = message.text.strip()
     text_lower = text.lower()
+    current_state = await state.get_state()
 
-    if "flashscore" in text_lower or "fotmob" in text_lower:
-        status_msg = await message.answer("🔍 Enlace válido. Extrayendo datos (Pre-partido / En vivo)...")
+    # Si está esperando la cuota tras haber seleccionado un botón
+    if current_state == AnalysisStates.waiting_for_quota.state:
+        processing_msg = await message.answer("🤖 Evaluando cuota, calculando EV y registrando en la base de datos...")
+        data = await state.get_data()
+        scraped_text = data.get("scraped_text", "")
+        last_url = data.get("last_url", "partido")
+        chosen_option = data.get("chosen_option", "Apuesta")
+
         try:
-            scraped_text, _, _ = await fetch_match_data(text)
-            if not scraped_text or len(scraped_text.strip()) < 80:
-                await status_msg.edit_text("❌ No se pudo leer el partido, intenta de nuevo.")
-                return
-        except Exception:
-            await status_msg.edit_text("❌ Error al extraer datos del partido.")
-            return
-
-        await state.update_data(scraped_text=scraped_text, last_url=text)
-        await status_msg.edit_text("📊 Analizando contexto, tiempo y estadísticas...")
-        try:
-            prompt = f"Datos del partido:\n\n{scraped_text}"
-            analysis_result = await gemini_generate_with_retry(SYSTEM_INSTRUCTION, prompt)
-            await message.answer(analysis_result, reply_markup=kb_cuota())
-            await state.set_state(AnalysisStates.waiting_for_quota_or_chat)
-            await status_msg.delete()
-        except Exception as e:
-            logging.error(f'API Error: {e}')
-            await status_msg.edit_text("❌ Error al procesar el partido. Intenta de nuevo, parcero.")
-        return
-
-    data = await state.get_data()
-    scraped_text = data.get("scraped_text", "")
-    last_url = data.get("last_url", "partido")
-
-    if scraped_text:
-        tiene_numero = re.search(r"\d+[.,]\d+", text)
-        
-        if not tiene_numero and ("otra" in text_lower or "opcion" in text_lower or "opción" in text_lower or "mas" in text_lower or "más" in text_lower):
-            refresh_msg = await message.answer("🔄 Buscando opciones tácticas diferentes...")
-            try:
-                prompt = f"Datos del partido:\n\n{scraped_text}\n\nGenera 3 mercados COMPLETAMENTE DIFERENTES adaptados al estado actual, ultra resumidos."
-                alt_result = await gemini_generate_with_retry(SYSTEM_INSTRUCTION, prompt)
-                await refresh_msg.edit_text(alt_result, reply_markup=kb_cuota(), parse_mode="Markdown")
-            except Exception as e:
-                logging.error(f'Error generando opciones alternativas: {e}')
-                await refresh_msg.edit_text("❌ No pude generar más opciones en este momento, parcero.")
-            return
-
-        processing_msg = await message.answer("🤖 Evaluando tu cuota y stake...")
-        try:
-            prompt = f"Contexto:\n{scraped_text}\n\nCuota elegida:\n{text}"
+            prompt = f"Contexto del partido:\n{scraped_text}\n\nOpción elegida por el usuario ({chosen_option}) con cuota:\n{text}"
             result = await gemini_generate_with_retry(SYSTEM_INSTRUCTION_CUOTA, prompt)
             
             cuota_val = 0.0
@@ -791,7 +769,7 @@ async def handle_user_flow(message: Message, state: FSMContext):
             conn = sqlite3.connect(DB_NAME)
             cursor = conn.cursor()
             cursor.execute("INSERT INTO historial_apuestas (telegram_id, partido, mercado, cuota, stake, estado, fecha) VALUES (?, ?, ?, ?, ?, 'PENDIENTE', ?)", 
-                           (telegram_id, last_url[:300], text[:120], cuota_val, stake_monto, fecha_now))
+                           (telegram_id, last_url[:300], f"{chosen_option}: {text}"[:120], cuota_val, stake_monto, fecha_now))
             conn.commit()
             hid = cursor.lastrowid
             conn.close()
@@ -806,10 +784,36 @@ async def handle_user_flow(message: Message, state: FSMContext):
             await state.set_state(AnalysisStates.waiting_for_link)
         except Exception as e:
             logging.error(f'API Error al evaluar cuota: {e}')
-            await processing_msg.edit_text("❌ Error al evaluar la cuota.")
+            await processing_msg.edit_text("❌ Error al evaluar la cuota, parcero.")
+            await state.set_state(AnalysisStates.waiting_for_link)
         return
 
-    await message.answer("⚠️ Envía un enlace válido de Flashscore o FotMob para empezar.", reply_markup=kb_proactivo())
+    # Si envía un enlace de partido
+    if "flashscore" in text_lower or "fotmob" in text_lower:
+        status_msg = await message.answer("🔍 Enlace válido. Extrayendo datos (Pre-partido / En vivo)...")
+        try:
+            scraped_text, _, _ = await fetch_match_data(text)
+            if not scraped_text or len(scraped_text.strip()) < 80:
+                await status_msg.edit_text("❌ No se pudo leer el partido, intenta de nuevo.")
+                return
+        except Exception:
+            await status_msg.edit_text("❌ Error al extraer datos del partido.")
+            return
+
+        await state.update_data(scraped_text=scraped_text, last_url=text)
+        await status_msg.edit_text("📊 Analizando contexto, tiempo y estadísticas con precisión...")
+        try:
+            prompt = f"Datos del partido:\n\n{scraped_text}"
+            analysis_result = await gemini_generate_with_retry(SYSTEM_INSTRUCTION, prompt)
+            await message.answer(analysis_result, reply_markup=kb_elegir_opcion("Opción A", "Opción B"), parse_mode="Markdown")
+            await state.set_state(AnalysisStates.waiting_for_option_choice)
+            await status_msg.delete()
+        except Exception as e:
+            logging.error(f'API Error: {e}')
+            await status_msg.edit_text("❌ Error al procesar el partido. Intenta de nuevo, parcero.")
+        return
+
+    await message.answer("⚠️ Envía un enlace válido de Flashscore o FotMob para empezar, o selecciona una opción del análisis anterior.", reply_markup=kb_proactivo())
     await state.set_state(AnalysisStates.waiting_for_link)
 
 # ==========================================
