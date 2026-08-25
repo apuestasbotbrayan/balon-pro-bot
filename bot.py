@@ -313,7 +313,7 @@ def kb_proactivo() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="💰 Consultar Banca", callback_data="consultar_banca")
         ],
         [
-            InlineKeyboardButton(text="🔗 Parley Sencillo", callback_data="iniciar_combinada"),
+            InlineKeyboardButton(text="🔗 Parley Sencillo", callback_data="modo_sencillo"),
             InlineKeyboardButton(text="⚡ Parley Combinado", callback_data="iniciar_combinada")
         ]
     ])
@@ -584,13 +584,23 @@ async def cb_ir_inicio(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AnalysisStates.waiting_for_link)
     await callback.message.answer("⚽ Envíame otro enlace de partido para analizar:", reply_markup=kb_proactivo())
 
+@router.callback_query(F.data == "modo_sencillo")
+async def cb_modo_sencillo(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.set_state(AnalysisStates.waiting_for_link)
+    await callback.message.answer(
+        "⚽ *Modo Parley Sencillo Activado*\n\n"
+        "Envíame el enlace de un solo partido de Flashscore o FotMob para analizar sus opciones de valor:",
+        parse_mode="Markdown"
+    )
+
 @router.callback_query(F.data == "iniciar_combinada")
 async def cb_iniciar_combinada(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await state.set_state(AnalysisStates.waiting_for_combinada_links)
     await state.update_data(combinada_links=[])
     await callback.message.answer(
-        "🔗 *Modo Analizar Parley / Combinado Activado*\n\n"
+        "⚡ *Modo Parley Combinado Activado*\n\n"
         "Envíame de **3 a 5 enlaces** de partidos (uno por uno o todos juntos en un mensaje). Cuando termines, escribe la palabra `analizar`.",
         parse_mode="Markdown"
     )
@@ -779,17 +789,17 @@ async def handle_user_flow(message: Message, state: FSMContext):
     text_lower = text.lower()
     current_state = await state.get_state()
 
-    # --- FLUJO DE COMBINADA / PARLEY ---
+    # --- FLUJO DE PARLEY COMBINADO ---
     if current_state == AnalysisStates.waiting_for_combinada_links.state:
         data = await state.get_data()
         links_list = data.get("combinada_links", [])
 
         if "analizar" in text_lower:
             if len(links_list) < 2:
-                await message.answer("⚠️ Necesito al menos 2 o 3 enlaces de partidos para armar un buen parley, parcero. Envía más enlaces.")
+                await message.answer("⚠️ Necesito al menos 2 o 3 enlaces de partidos para armar un buen parley combinado, parcero. Envía más enlaces.")
                 return
 
-            status_msg = await message.answer("🔍 Extrayendo datos de todos los partidos para el parley...")
+            status_msg = await message.answer("🔍 Extrayendo datos de todos los partidos para el parley combinado...")
             scraped_texts = []
             for link in links_list:
                 try:
@@ -804,7 +814,7 @@ async def handle_user_flow(message: Message, state: FSMContext):
                 await state.set_state(AnalysisStates.waiting_for_link)
                 return
 
-            await status_msg.edit_text("🤖 Cruzando estadísticas y armando el Parley Maestro...")
+            await status_msg.edit_text("🤖 Cruzando estadísticas y armando el Parley Combinado Maestro...")
             try:
                 prompt_combinada = "Datos de los partidos:\n\n" + "\n\n".join(scraped_texts)
                 result = await gemini_generate_with_retry(SYSTEM_INSTRUCTION_COMBINADA, prompt_combinada)
@@ -824,7 +834,7 @@ async def handle_user_flow(message: Message, state: FSMContext):
                 conn = sqlite3.connect(DB_NAME)
                 cursor = conn.cursor()
                 cursor.execute("INSERT INTO historial_apuestas (telegram_id, partido, mercado, cuota, stake, estado, fecha) VALUES (?, ?, ?, ?, ?, 'PENDIENTE', ?)", 
-                               (telegram_id, "Parley / Combinada", "Combinada Maestra", cuota_val, stake_monto, fecha_now))
+                               (telegram_id, "Parley Combinado", "Combinada Maestra", cuota_val, stake_monto, fecha_now))
                 conn.commit()
                 hid = cursor.lastrowid
                 conn.close()
@@ -832,7 +842,7 @@ async def handle_user_flow(message: Message, state: FSMContext):
                 banca_nueva = get_banca(telegram_id)
                 stake_msg = f"\n\n📝 Guardado en historial `#{hid}` ⏳"
                 if stake_monto > 0:
-                    stake_msg += f"\n💰 Stake apostado Parley (2%): {format_pesos(stake_monto)}\n📉 Nueva Banca: {format_pesos(banca_nueva)}"
+                    stake_msg += f"\n💰 Stake apostado Combinado (2%): {format_pesos(stake_monto)}\n📉 Nueva Banca: {format_pesos(banca_nueva)}"
 
                 result_final = result + stake_msg
                 await message.answer(result_final, parse_mode="Markdown", reply_markup=kb_calificar_apuesta(hid))
@@ -840,7 +850,7 @@ async def handle_user_flow(message: Message, state: FSMContext):
                 await state.set_state(AnalysisStates.waiting_for_link)
             except Exception as e:
                 logging.error(f"Error generando combinada: {e}")
-                await message.answer("❌ Error al generar el parley, parcero.", reply_markup=kb_proactivo())
+                await message.answer("❌ Error al generar el parley combinado, parcero.", reply_markup=kb_proactivo())
                 await state.set_state(AnalysisStates.waiting_for_link)
             return
 
@@ -911,7 +921,7 @@ async def handle_user_flow(message: Message, state: FSMContext):
             await state.set_state(AnalysisStates.waiting_for_link)
         return
 
-    # --- FLUJO DE ENLACE DE PARTIDO ---
+    # --- FLUJO DE ENLACE DE PARTIDO (PARLEY SENCILLO) ---
     if "flashscore" in text_lower or "fotmob" in text_lower:
         status_msg = await message.answer("🔍 Enlace válido. Extrayendo datos (Pre-partido / En vivo)...")
         try:
