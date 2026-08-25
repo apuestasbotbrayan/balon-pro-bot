@@ -286,12 +286,19 @@ SYSTEM_INSTRUCTION = (
 )
 
 SYSTEM_INSTRUCTION_CUOTA = (
-    "Actúa como tipster colombiano firme y directo. El usuario te dará una opción elegida junto con la cuota o una modificación de la línea de la casa de apuestas (por ejemplo, cambió de 8.5 a 9.5 córners). "
+    "Actúa como tipster colombiano firme y directo. El usuario te dará una opción elegida junto con la cuota o una modificación de la línea de la casa de apuestas. "
     "Analiza si la nueva línea o cuota tiene valor real (EV > 5%). "
     "Responde en MÁXIMO 3 LÍNEAS: "
     "Línea 1: veredicto con emoji: si hay valor -> '🟢 ¡Métale con confianza!' si no -> '🔴 ¡Pilas, no bote la plata por ahí!'. "
     "Línea 2: breve análisis adaptado a la nueva línea o cuota aportada. "
     "Línea 3: casa recomendada: '📍 Búscala en [BetPlay/Wplay/Codere/Zamba]'."
+)
+
+SYSTEM_INSTRUCTION_COMBINADA = (
+    "Actúa como tipster profesional colombiano experto en apuestas combinadas (parlays) pre-partido. "
+    "Recibirás los datos de varios partidos. Selecciona la mejor opción de valor por cada partido y arma una combinada maestra de alta solidez. "
+    "Presenta cada selección de forma ultra resumida y al final calcula una cuota total estimada razonable. "
+    "Mantén el tono directo, profesional y de analista experto."
 )
 
 # ==========================================
@@ -302,6 +309,9 @@ def kb_proactivo() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(text="📊 Ver Historial", callback_data="ver_historial"),
             InlineKeyboardButton(text="💰 Consultar Banca", callback_data="consultar_banca")
+        ],
+        [
+            InlineKeyboardButton(text="🔗 Armar Combinada (Parley)", callback_data="iniciar_combinada")
         ]
     ])
 
@@ -328,6 +338,13 @@ def kb_calificar_apuesta(apuesta_id: int) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(text="✅ Acertada", callback_data=f"est_ok_{apuesta_id}"),
             InlineKeyboardButton(text="❌ Fallida", callback_data=f"est_fail_{apuesta_id}")
+        ]
+    ])
+
+def kb_solo_analizar_otro() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🔄 Analizar otro partido", callback_data="ir_inicio")
         ]
     ])
 
@@ -527,6 +544,7 @@ class AnalysisStates(StatesGroup):
     waiting_for_link = State()
     waiting_for_option_choice = State()
     waiting_for_quota = State()
+    waiting_for_combinada_links = State()
 
 router = Router()
 
@@ -552,9 +570,26 @@ async def cmd_start(message: Message, state: FSMContext):
     await state.set_state(AnalysisStates.waiting_for_link)
     await message.answer(
         "👋 *¡Bienvenido al Tipster Bot Pro, mi hermano!*\n\n"
-        "📎 Envíame un enlace de Flashscore o FotMob (Pre-partido o En Vivo), o una foto de tu apuesta, y te entrego las mejores Value Bets al instante.",
+        "📎 Envíame un enlace de Flashscore o FotMob, o toca el botón para armar una **Combinada (Parley)**.",
         parse_mode="Markdown",
         reply_markup=kb_proactivo()
+    )
+
+@router.callback_query(F.data == "ir_inicio")
+async def cb_ir_inicio(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.set_state(AnalysisStates.waiting_for_link)
+    await callback.message.answer("⚽ Envíame otro enlace de partido para analizar:", reply_markup=kb_proactivo())
+
+@router.callback_query(F.data == "iniciar_combinada")
+async def cb_iniciar_combinada(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.set_state(AnalysisStates.waiting_for_combinada_links)
+    await state.update_data(combinada_links=[])
+    await callback.message.answer(
+        "🔗 *Modo Combinada (Parley) Activado*\n\n"
+        "Envíame de **3 a 5 enlaces** de partidos (uno por uno o todos juntos en un mensaje). Cuando termines, escribe la palabra `analizar`.",
+        parse_mode="Markdown"
     )
 
 @router.message(Command("generar"))
@@ -741,7 +776,54 @@ async def handle_user_flow(message: Message, state: FSMContext):
     text_lower = text.lower()
     current_state = await state.get_state()
 
-    # Si está esperando la cuota o corrección de línea tras haber seleccionado un botón
+    # --- FLUJO DE COMBINADA (PARLEY) ---
+    if current_state == AnalysisStates.waiting_for_combinada_links.state:
+        data = await state.get_data()
+        links_list = data.get("combinada_links", [])
+
+        if "analizar" in text_lower:
+            if len(links_list) < 2:
+                await message.answer("⚠️ Necesito al menos 2 o 3 enlaces de partidos para armar una buena combinada, parcero. Envía más enlaces.")
+                return
+
+            status_msg = await message.answer("🔍 Extrayendo datos de todos los partidos para la combinada...")
+            scraped_texts = []
+            for link in links_list:
+                try:
+                    txt, _, _ = await fetch_match_data(link)
+                    if txt and len(txt.strip()) > 80:
+                        scraped_texts.append(f"--- PARTIDO ---\n{txt}")
+                except Exception:
+                    pass
+
+            if not scraped_texts:
+                await status_msg.edit_text("❌ No pude extraer datos de los enlaces, parcero. Intenta de nuevo.")
+                await state.set_state(AnalysisStates.waiting_for_link)
+                return
+
+            await status_msg.edit_text("🤖 Analizando y cruzando estadísticas para la Combinada Maestra...")
+            try:
+                prompt_combinada = "Datos de los partidos:\n\n" + "\n\n".join(scraped_texts)
+                result = await gemini_generate_with_retry(SYSTEM_INSTRUCTION_COMBINADA, prompt_combinada)
+                await message.answer(result, parse_mode="Markdown", reply_markup=kb_proactivo())
+                await state.set_state(AnalysisStates.waiting_for_link)
+            except Exception as e:
+                logging.error(f"Error generando combinada: {e}")
+                await message.answer("❌ Error al generar la combinada, parcero.", reply_markup=kb_proactivo())
+                await state.set_state(AnalysisStates.waiting_for_link)
+            return
+
+        # Extraer URLs del mensaje
+        urls_encontradas = re.findall(r'https?://[^\s]+', text)
+        if urls_encontradas:
+            links_list.extend(urls_encontradas)
+            await state.update_data(combinada_links=links_list)
+            await message.answer(f"✅ Enlaces acumulados: {len(links_list)}. Envía más o escribe `analizar` para procesar.")
+        else:
+            await message.answer("⚠️ Envía un enlace válido o escribe `analizar` cuando estés listo.")
+        return
+
+    # --- FLUJO DE EVALUACIÓN DE CUOTA / LÍNEA ---
     if current_state == AnalysisStates.waiting_for_quota.state:
         processing_msg = await message.answer("🤖 Reajustando análisis con la línea de tu casa de apuestas y calculando EV...")
         data = await state.get_data()
@@ -753,6 +835,9 @@ async def handle_user_flow(message: Message, state: FSMContext):
             prompt = f"Contexto del partido:\n{scraped_text}\n\nOpción elegida por el usuario: {chosen_option}\nAjuste o cuota indicada por el usuario:\n{text}"
             result = await gemini_generate_with_retry(SYSTEM_INSTRUCTION_CUOTA, prompt)
             
+            # Detectar si la IA dio luz verde o roja
+            es_favorable = "🟢" in result or "confianza" in result.lower()
+
             cuota_val = 0.0
             try:
                 match = re.search(r"(\d+[.,]\d+)", text)
@@ -762,26 +847,36 @@ async def handle_user_flow(message: Message, state: FSMContext):
                 pass
 
             banca = get_banca(telegram_id)
-            stake_monto = banca * 0.03 if banca > 0 else 0.0
+            stake_monto = 0.0
+            hid = 0
 
-            if stake_monto > 0:
-                descontar_banca(telegram_id, stake_monto)
+            # Solo si es favorable guardamos en historial y descontamos banca
+            if es_favorable:
+                stake_monto = banca * 0.03 if banca > 0 else 0.0
+                if stake_monto > 0:
+                    descontar_banca(telegram_id, stake_monto)
 
-            fecha_now = datetime.now().strftime("%Y-%m-%d %H:%M")
-            conn = sqlite3.connect(DB_NAME)
-            cursor = conn.cursor()
-            cursor.execute("INSERT INTO historial_apuestas (telegram_id, partido, mercado, cuota, stake, estado, fecha) VALUES (?, ?, ?, ?, ?, 'PENDIENTE', ?)", 
-                           (telegram_id, last_url[:300], f"{chosen_option}: {text}"[:120], cuota_val, stake_monto, fecha_now))
-            conn.commit()
-            hid = cursor.lastrowid
-            conn.close()
+                fecha_now = datetime.now().strftime("%Y-%m-%d %H:%M")
+                conn = sqlite3.connect(DB_NAME)
+                cursor = conn.cursor()
+                cursor.execute("INSERT INTO historial_apuestas (telegram_id, partido, mercado, cuota, stake, estado, fecha) VALUES (?, ?, ?, ?, ?, 'PENDIENTE', ?)", 
+                               (telegram_id, last_url[:300], f"{chosen_option}: {text}"[:120], cuota_val, stake_monto, fecha_now))
+                conn.commit()
+                hid = cursor.lastrowid
+                conn.close()
 
-            banca_nueva = get_banca(telegram_id)
-            stake_msg = f"\n\n📝 Guardado en historial `#{hid}` ⏳"
-            if stake_monto > 0:
-                stake_msg += f"\n💰 Stake apostado (3%): {format_pesos(stake_monto)}\n📉 Nueva Banca: {format_pesos(banca_nueva)}"
+                banca_nueva = get_banca(telegram_id)
+                stake_msg = f"\n\n📝 Guardado en historial `#{hid}` ⏳"
+                if stake_monto > 0:
+                    stake_msg += f"\n💰 Stake apostado (3%): {format_pesos(stake_monto)}\n📉 Nueva Banca: {format_pesos(banca_nueva)}"
+                result += stake_msg
 
-            await processing_msg.edit_text(result + stake_msg, parse_mode="Markdown", reply_markup=kb_calificar_apuesta(hid))
+                # Mostrar botones de calificación solo si fue favorable
+                await processing_msg.edit_text(result, parse_mode="Markdown", reply_markup=kb_calificar_apuesta(hid))
+            else:
+                # Si fue desfavorable (🔴), NO se guarda en historial y se pone botón de analizar otro
+                await processing_msg.edit_text(result, parse_mode="Markdown", reply_markup=kb_solo_analizar_otro())
+
             await message.answer("¿Qué otro partido analizamos, parcero? Envíame otro enlace.", reply_markup=kb_proactivo())
             await state.set_state(AnalysisStates.waiting_for_link)
         except Exception as e:
@@ -790,7 +885,7 @@ async def handle_user_flow(message: Message, state: FSMContext):
             await state.set_state(AnalysisStates.waiting_for_link)
         return
 
-    # Si envía un enlace de partido
+    # --- FLUJO DE ENLACE DE PARTIDO ---
     if "flashscore" in text_lower or "fotmob" in text_lower:
         status_msg = await message.answer("🔍 Enlace válido. Extrayendo datos (Pre-partido / En vivo)...")
         try:
@@ -815,7 +910,7 @@ async def handle_user_flow(message: Message, state: FSMContext):
             await status_msg.edit_text("❌ Error al procesar el partido. Intenta de nuevo, parcero.")
         return
 
-    await message.answer("⚠️ Envía un enlace válido de Flashscore o FotMob para empezar, o selecciona una opción del análisis anterior.", reply_markup=kb_proactivo())
+    await message.answer("⚠️ Envía un enlace válido de Flashscore o FotMob para empezar, o selecciona una opción del menú.", reply_markup=kb_proactivo())
     await state.set_state(AnalysisStates.waiting_for_link)
 
 # ==========================================
