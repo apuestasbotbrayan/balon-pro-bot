@@ -202,7 +202,7 @@ async def fetch_fotmob_data(url: str) -> tuple[str, str, str]:
                 f"Partido: {teams_txt}",
                 f"Liga: {league}",
                 f"Estado: {estado_txt} | Minuto actual: {minute} | Marcador: {score}",
-                f"Contexto temporal: {'Partido pre-partido' if estado_txt == 'Pre-partido' else f'ATENCIÓN EN VIVO: Minuto {minute} con marcador {score}. Adapta los mercados de riesgo.'}"
+                f"Contexto temporal: {'Partido pre-partido. PROHIBIDO inventar marcadores o situaciones en vivo.' if estado_txt == 'Pre-partido' else f'ATENCIÓN EN VIVO: Minuto {minute} con marcador {score}.'}"
             ]
 
             match_facts = content.get("matchFacts") or {}
@@ -242,7 +242,7 @@ current_key_index = 0
 ADMIN_ID = int(os.getenv("ADMIN_ID", "8021280020"))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://balon-pro-bot.onrender.com")
 DB_NAME = "bot_database_v2.db"
-GEMINI_MODEL_ID = "gemini-3.6-flash"
+GEMINI_MODEL_ID = "gemini-2.5-flash"
 
 def get_next_ai_client():
     global current_key_index
@@ -274,11 +274,14 @@ async def gemini_generate_with_retry(system_instruction: str, user_prompt: str, 
                 continue
             raise
 
+# ==========================================
+# INSTRUCCIONES BLINDADAS (CERO ALUCINACIONES)
+# ==========================================
 SYSTEM_INSTRUCTION = (
     "Actúa como tipster profesional colombiano experto y de máxima exigencia. "
-    "Analiza con lupa el MINUTO ACTUAL y el MARCADOR del partido. "
-    "Presenta exactamente DOS opciones de alta convicción y valor (Opción A y Opción B), variando inteligentemente entre mercados estables (tiros de esquina/córners, doble oportunidad o goles calculados). "
-    "PROHIBIDO poner números de cuota falsos. "
+    "REGLA CRÍTICA ABSOLUTA: Si el evento es PRE-PARTIDO, tienes estrictamente PROHIBIDO inventar marcadores en contra, situaciones en vivo o goles fantasma. "
+    "Básate única y exclusivamente en estadísticas reales de temporada, promedios y tendencias lógicas. "
+    "Presenta exactamente DOS opciones de alta convicción y valor (Opción A y Opción B), variando inteligentemente entre mercados estables (córners lógicos, doble oportunidad o goles). "
     "Usa puros emojis profesionales, cero caracteres raros. "
     "Formato obligatorio exacto:\n"
     "OPCIÓN A: [Mercado y justificación corta] | 📍 [Casa]\n"
@@ -287,7 +290,7 @@ SYSTEM_INSTRUCTION = (
 )
 
 SYSTEM_INSTRUCTION_CUOTA = (
-    "Actúa como tipster colombiano firme y directo. El usuario te dará una opción elegida junto con la cuota o una modificación de la línea de la casa de apuestas. "
+    "Actúa como tipster colombiano firme y directo. El usuario te dará una opción elegida junto con la cuota o modificación de la línea de la casa de apuestas. "
     "Analiza si la nueva línea o cuota tiene valor real (EV > 5%). "
     "Usa puros emojis profesionales, cero caracteres raros. "
     "Responde en MÁXIMO 3 LÍNEAS: "
@@ -299,8 +302,16 @@ SYSTEM_INSTRUCTION_CUOTA = (
 SYSTEM_INSTRUCTION_COMBINADA = (
     "Actúa como tipster profesional colombiano experto en apuestas combinadas (parlays) pre-partido. "
     "Recibirás los datos de varios partidos. Selecciona la mejor opción de valor por cada partido y arma una combinada maestra de alta solidez. "
+    "CERO alucinaciones: respeta los datos reales de los partidos suministrados. "
     "Usa puros emojis profesionales, cero caracteres raros. "
     "Presenta cada selección de forma ultra resumida y al final debes incluir estrictamente una línea que diga: 'Cuota Total Estimada: [número]' (ej: Cuota Total Estimada: 4.50)."
+)
+
+SYSTEM_INSTRUCTION_SONADORA = (
+    "Actúa como tipster experto en cuotas altas y 'Combinadas Soñadoras' (Cuotas 5.00 en adelante). "
+    "Busca mercados de valor estadístico elevado (combinaciones de goles, córners o resultados ajustados). "
+    "Incluye obligatoriamente al inicio una advertencia clara de gestión de riesgo estricta (Stake controlado mínimo del 1% al 2%). "
+    "Usa puros emojis profesionales y finaliza con la 'Cuota Total Estimada: [número]'."
 )
 
 # ==========================================
@@ -315,6 +326,9 @@ def kb_proactivo() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(text="🔗 Parley Sencillo", callback_data="modo_sencillo"),
             InlineKeyboardButton(text="⚡ Parley Combinado", callback_data="iniciar_combinada")
+        ],
+        [
+            InlineKeyboardButton(text="🔥 Combinada Soñadora", callback_data="modo_sonadora")
         ]
     ])
 
@@ -548,6 +562,7 @@ class AnalysisStates(StatesGroup):
     waiting_for_option_choice = State()
     waiting_for_quota = State()
     waiting_for_combinada_links = State()
+    waiting_for_sonadora_link = State()
 
 router = Router()
 
@@ -602,6 +617,16 @@ async def cb_iniciar_combinada(callback: CallbackQuery, state: FSMContext):
     await callback.message.answer(
         "⚡ *Modo Parley Combinado Activado*\n\n"
         "Envíame de **3 a 5 enlaces** de partidos (uno por uno o todos juntos en un mensaje). Cuando termines, escribe la palabra `analizar`.",
+        parse_mode="Markdown"
+    )
+
+@router.callback_query(F.data == "modo_sonadora")
+async def cb_modo_sonadora(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.set_state(AnalysisStates.waiting_for_sonadora_link)
+    await callback.message.answer(
+        "🔥 *Modo Combinada Soñadora Activado (Cuotas 5.00+)*\n\n"
+        "Envíame el enlace del partido principal para cazar una cuota alta con alto valor estadístico:",
         parse_mode="Markdown"
     )
 
@@ -788,6 +813,48 @@ async def handle_user_flow(message: Message, state: FSMContext):
     text = message.text.strip()
     text_lower = text.lower()
     current_state = await state.get_state()
+
+    # --- FLUJO DE COMBINADA SOÑADORA ---
+    if current_state == AnalysisStates.waiting_for_sonadora_link.state:
+        urls = re.findall(r'https?://[^\s]+', text)
+        if not urls:
+            await message.answer("⚠️ Envía un enlace válido de partido para la Combinada Soñadora.")
+            return
+
+        status_msg = await message.answer("🔥 Buscando cuota alta y analizando parámetros de la Combinada Soñadora...")
+        try:
+            scraped_text, _, _ = await fetch_match_data(urls[0])
+            prompt = f"Datos del partido:\n\n{scraped_text}"
+            result = await gemini_generate_with_retry(SYSTEM_INSTRUCTION_SONADORA, prompt)
+
+            cuota_val = 5.00
+            match_cuota = re.search(r"cuota total estimada[:\s]*(\d+[.,]\d+)", result, re.IGNORECASE)
+            if match_cuota:
+                cuota_val = float(match_cuota.group(1).replace(",", "."))
+
+            banca = get_banca(telegram_id)
+            stake_monto = banca * 0.01 if banca > 0 else 0.0 # Stake mínimo 1% recomendado para soñadoras
+            if stake_monto > 0:
+                descontar_banca(telegram_id, stake_monto)
+
+            fecha_now = datetime.now().strftime("%Y-%m-%d %H:%M")
+            conn = sqlite3.connect(DB_NAME)
+            cursor = conn.cursor()
+            cursor.execute("INSERT INTO historial_apuestas (telegram_id, partido, mercado, cuota, stake, estado, fecha) VALUES (?, ?, ?, ?, ?, 'PENDIENTE', ?)", 
+                           (telegram_id, "Combinada Soñadora", "Cuota Alta 5.0+", cuota_val, stake_monto, fecha_now))
+            conn.commit()
+            hid = cursor.lastrowid
+            conn.close()
+
+            stake_msg = f"\n\n📝 Guardado en historial `#{hid}` ⏳\n💰 Stake Soñador (1%): {format_pesos(stake_monto)}"
+            await status_msg.edit_text(result + stake_msg, parse_mode="Markdown", reply_markup=kb_calificar_apuesta(hid))
+            await message.answer("¿Qué más vamos a cazar, parcero?", reply_markup=kb_proactivo())
+            await state.set_state(AnalysisStates.waiting_for_link)
+        except Exception as e:
+            logging.error(f"Error en Combinada Soñadora: {e}")
+            await status_msg.edit_text("❌ Ocurrió un error procesando la soñadora.")
+            await state.set_state(AnalysisStates.waiting_for_link)
+        return
 
     # --- FLUJO DE PARLEY COMBINADO ---
     if current_state == AnalysisStates.waiting_for_combinada_links.state:
