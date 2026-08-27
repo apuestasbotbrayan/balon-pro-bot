@@ -309,9 +309,9 @@ SYSTEM_INSTRUCTION_COMBINADA = (
 
 SYSTEM_INSTRUCTION_SONADORA = (
     "Actúa como tipster experto en cuotas altas y 'Combinadas Soñadoras' (Cuotas 5.00 en adelante). "
-    "Busca mercados de valor estadístico elevado (combinaciones de goles, córners o resultados ajustados). "
+    "Recibirás los datos de varios partidos seleccionados por el usuario. Cruza las estadísticas para armar un parley explosivo de cuota alta (5.00+). "
     "Incluye obligatoriamente al inicio una advertencia clara de gestión de riesgo estricta (Stake controlado mínimo del 1% al 2%). "
-    "Usa puros emojis profesionales y finaliza con la 'Cuota Total Estimada: [número]'."
+    "Usa puros emojis profesionales y finaliza estrictamente con una línea que diga: 'Cuota Total Estimada: [número]' (ej: Cuota Total Estimada: 6.50)."
 )
 
 # ==========================================
@@ -562,7 +562,7 @@ class AnalysisStates(StatesGroup):
     waiting_for_option_choice = State()
     waiting_for_quota = State()
     waiting_for_combinada_links = State()
-    waiting_for_sonadora_link = State()
+    waiting_for_sonadora_links = State()
 
 router = Router()
 
@@ -616,17 +616,18 @@ async def cb_iniciar_combinada(callback: CallbackQuery, state: FSMContext):
     await state.update_data(combinada_links=[])
     await callback.message.answer(
         "⚡ *Modo Parley Combinado Activado*\n\n"
-        "Envíame de **3 a 5 enlaces** de partidos (uno por uno o todos juntos en un mensaje). Cuando termines, escribe la palabra `analizar`.",
+        "Envíame de **2 a 5 enlaces** de partidos (uno por uno o todos juntos en un mensaje). Cuando termines, escribe la palabra `analizar`.",
         parse_mode="Markdown"
     )
 
 @router.callback_query(F.data == "modo_sonadora")
 async def cb_modo_sonadora(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
-    await state.set_state(AnalysisStates.waiting_for_sonadora_link)
+    await state.set_state(AnalysisStates.waiting_for_sonadora_links)
+    await state.update_data(sonadora_links=[])
     await callback.message.answer(
         "🔥 *Modo Combinada Soñadora Activado (Cuotas 5.00+)*\n\n"
-        "Envíame el enlace del partido principal para cazar una cuota alta con alto valor estadístico:",
+        "Envíame de **2 a 4 enlaces** de partidos para cazar una cuota gigante. Cuando termines de enviar los enlaces, escribe la palabra `analizar`.",
         parse_mode="Markdown"
     )
 
@@ -814,46 +815,75 @@ async def handle_user_flow(message: Message, state: FSMContext):
     text_lower = text.lower()
     current_state = await state.get_state()
 
-    # --- FLUJO DE COMBINADA SOÑADORA ---
-    if current_state == AnalysisStates.waiting_for_sonadora_link.state:
-        urls = re.findall(r'https?://[^\s]+', text)
-        if not urls:
-            await message.answer("⚠️ Envía un enlace válido de partido para la Combinada Soñadora.")
+    # --- FLUJO DE COMBINADA SOÑADORA (MULTIENLACE) ---
+    if current_state == AnalysisStates.waiting_for_sonadora_links.state:
+        data = await state.get_data()
+        links_list = data.get("sonadora_links", [])
+
+        if "analizar" in text_lower:
+            if len(links_list) < 2:
+                await message.answer("⚠️ Necesito al menos 2 enlaces para armar una Combinada Soñadora potente, parcero. Envía más enlaces.")
+                return
+
+            status_msg = await message.answer("🔥 Extrayendo datos de los partidos para cazar la Combinada Soñadora (Cuotas 5.00+)...")
+            scraped_texts = []
+            for link in links_list:
+                try:
+                    txt, _, _ = await fetch_match_data(link)
+                    if txt and len(txt.strip()) > 80:
+                        scraped_texts.append(f"--- PARTIDO ---\n{txt}")
+                except Exception:
+                    pass
+
+            if not scraped_texts:
+                await status_msg.edit_text("❌ No pude extraer datos de los enlaces, parcero. Intenta de nuevo.")
+                await state.set_state(AnalysisStates.waiting_for_link)
+                return
+
+            await status_msg.edit_text("🤖 Cruzando estadísticas de alto valor y calculando la cuota gigante...")
+            try:
+                prompt_sonadora = "Datos de los partidos para Combinada Soñadora:\n\n" + "\n\n".join(scraped_texts)
+                result = await gemini_generate_with_retry(SYSTEM_INSTRUCTION_SONADORA, prompt_sonadora)
+
+                cuota_val = 5.00
+                match_cuota = re.search(r"cuota total estimada[:\s]*(\d+[.,]\d+)", result, re.IGNORECASE)
+                if match_cuota:
+                    cuota_val = float(match_cuota.group(1).replace(",", "."))
+
+                banca = get_banca(telegram_id)
+                stake_monto = banca * 0.01 if banca > 0 else 0.0
+                if stake_monto > 0:
+                    descontar_banca(telegram_id, stake_monto)
+
+                fecha_now = datetime.now().strftime("%Y-%m-%d %H:%M")
+                conn = sqlite3.connect(DB_NAME)
+                cursor = conn.cursor()
+                cursor.execute("INSERT INTO historial_apuestas (telegram_id, partido, mercado, cuota, stake, estado, fecha) VALUES (?, ?, ?, ?, ?, 'PENDIENTE', ?)", 
+                               (telegram_id, "Combinada Soñadora", "Cuota Alta 5.0+", cuota_val, stake_monto, fecha_now))
+                conn.commit()
+                hid = cursor.lastrowid
+                conn.close()
+
+                stake_msg = f"\n\n📝 Guardado en historial `#{hid}` ⏳"
+                if stake_monto > 0:
+                    stake_msg += f"\n💰 Stake Soñador (1%): {format_pesos(stake_monto)}"
+
+                await message.answer(result + stake_msg, parse_mode="Markdown", reply_markup=kb_calificar_apuesta(hid))
+                await message.answer("¿Qué más vamos a cazar, parcero?", reply_markup=kb_proactivo())
+                await state.set_state(AnalysisStates.waiting_for_link)
+            except Exception as e:
+                logging.error(f"Error en Combinada Soñadora: {e}")
+                await message.answer("❌ Ocurrió un error procesando la soñadora.", reply_markup=kb_proactivo())
+                await state.set_state(AnalysisStates.waiting_for_link)
             return
 
-        status_msg = await message.answer("🔥 Buscando cuota alta y analizando parámetros de la Combinada Soñadora...")
-        try:
-            scraped_text, _, _ = await fetch_match_data(urls[0])
-            prompt = f"Datos del partido:\n\n{scraped_text}"
-            result = await gemini_generate_with_retry(SYSTEM_INSTRUCTION_SONADORA, prompt)
-
-            cuota_val = 5.00
-            match_cuota = re.search(r"cuota total estimada[:\s]*(\d+[.,]\d+)", result, re.IGNORECASE)
-            if match_cuota:
-                cuota_val = float(match_cuota.group(1).replace(",", "."))
-
-            banca = get_banca(telegram_id)
-            stake_monto = banca * 0.01 if banca > 0 else 0.0
-            if stake_monto > 0:
-                descontar_banca(telegram_id, stake_monto)
-
-            fecha_now = datetime.now().strftime("%Y-%m-%d %H:%M")
-            conn = sqlite3.connect(DB_NAME)
-            cursor = conn.cursor()
-            cursor.execute("INSERT INTO historial_apuestas (telegram_id, partido, mercado, cuota, stake, estado, fecha) VALUES (?, ?, ?, ?, ?, 'PENDIENTE', ?)", 
-                           (telegram_id, "Combinada Soñadora", "Cuota Alta 5.0+", cuota_val, stake_monto, fecha_now))
-            conn.commit()
-            hid = cursor.lastrowid
-            conn.close()
-
-            stake_msg = f"\n\n📝 Guardado en historial `#{hid}` ⏳\n💰 Stake Soñador (1%): {format_pesos(stake_monto)}"
-            await status_msg.edit_text(result + stake_msg, parse_mode="Markdown", reply_markup=kb_calificar_apuesta(hid))
-            await message.answer("¿Qué más vamos a cazar, parcero?", reply_markup=kb_proactivo())
-            await state.set_state(AnalysisStates.waiting_for_link)
-        except Exception as e:
-            logging.error(f"Error en Combinada Soñadora: {e}")
-            await status_msg.edit_text("❌ Ocurrió un error procesando la soñadora.")
-            await state.set_state(AnalysisStates.waiting_for_link)
+        urls_encontradas = re.findall(r'https?://[^\s]+', text)
+        if urls_encontradas:
+            links_list.extend(urls_encontradas)
+            await state.update_data(sonadora_links=links_list)
+            await message.answer(f"🔥 Enlaces soñadores acumulados: {len(links_list)}. Envía más o escribe `analizar` cuando estés listo.")
+        else:
+            await message.answer("⚠️ Envía un enlace válido o escribe `analizar` cuando tengas tus partidos listos.")
         return
 
     # --- FLUJO DE PARLEY COMBINADO ---
